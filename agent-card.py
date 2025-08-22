@@ -7,6 +7,8 @@ from langflow.io import (
     Output,
     BoolInput,
     HandleInput,
+    StrInput,
+    DropdownInput,
 )
 from langflow.schema.message import Message
 

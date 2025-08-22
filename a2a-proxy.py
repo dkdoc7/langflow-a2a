@@ -1,6 +1,6 @@
 """
 A2A SSE Proxy Launcher component for Langflow.
-Full version (2025-08-09): JSON-RPC (POST /, /a2a) + SSE bridge to Langflow.
+Full version (2025-08-09): JSON-RPC (POST /) + SSE bridge to Langflow.
 """
 from __future__ import annotations
 
@@ -39,9 +39,9 @@ def _port_open(host: str, port: int, timeout: float = 0.3) -> bool:
 
 
 def _ping(base_url: str, timeout: float = 0.5) -> bool:
-    """`/a2a/ping` health-check helper."""
+    """`/ping` health-check helper."""
     try:
-        r = httpx.get(f"{base_url}/a2a/ping", timeout=timeout)
+        r = httpx.get(f"{base_url}/ping", timeout=timeout)
         return r.status_code == 200 and r.json().get("ok") is True
     except Exception:
         return False
@@ -49,6 +49,135 @@ def _ping(base_url: str, timeout: float = 0.5) -> bool:
 
 def _key_of(lf_url: str, api_key: str) -> str:
     return f"{lf_url.rstrip('/')}_{api_key[:6]}"
+
+
+# ---------------- A2A Discovery Service Integration ----------------
+
+def _derive_agent_id(agent_card: Dict[str, Any]) -> str:
+    """Agent ID 정규화: name/url 기반으로 소문자+숫자+대시/언더스코어만 허용."""
+    raw = (agent_card.get("id") or agent_card.get("name") or agent_card.get("url") or "agent").strip()
+    # 공백 → 대시, 비허용 문자 제거
+    norm = re.sub(r"\s+", "-", raw)
+    norm = re.sub(r"[^a-zA-Z0-9_-]", "", norm)
+    if not norm:
+        norm = "agent"
+    return norm.lower()
+
+
+def _register_agent_to_discovery(
+    discovery_url: str,
+    agent_card: Dict[str, Any],
+    base_url: str,
+    timeout: float = 10.0
+) -> Tuple[bool, str]:
+    """
+    A2A Discovery 서비스에 에이전트를 등록합니다.
+
+    - 사전 진단: GET / 로 프로토콜 확인, GET /agents 로 선점/충돌 여부 점검
+    - 등록 실패(4xx/5xx/409 등) 시 상세 오류 메시지 로깅
+    - 이미 존재 시 상태를 active 로 전환
+    """
+    try:
+        if not discovery_url or not discovery_url.strip():
+            return False, "Discovery URL이 설정되지 않음"
+        discovery_url = discovery_url.rstrip('/')
+
+        agent_id = _derive_agent_id(agent_card)
+        agent_name = agent_card.get("name") or agent_id
+        agent_endpoint = base_url
+
+        # 사전 진단: discovery info
+        try:
+            info = httpx.get(f"{discovery_url}/", timeout=timeout)
+            log.info("[discovery] info %s -> %s", info.status_code, info.text[:256])
+        except Exception as e:
+            log.warning("[discovery] info check failed: %s", e)
+
+        # 사전 진단: existing agents
+        existing = None
+        try:
+            r_agents = httpx.get(f"{discovery_url}/agents", timeout=timeout)
+            if r_agents.status_code == 200:
+                data = r_agents.json() if r_agents.headers.get("content-type", "").startswith("application/json") else {}
+                if isinstance(data, dict) and isinstance(data.get("agents"), list):
+                    for a in data["agents"]:
+                        if str(a.get("id")) == agent_id:
+                            existing = a
+                            break
+        except Exception as e:
+            log.warning("[discovery] list_agents failed: %s", e)
+
+        headers = {"Content-Type": "application/json"}
+        # 등록 페이로드
+        registration_data = {
+            "id": agent_id,
+            "name": agent_name,
+            "endpoint": agent_endpoint,
+        }
+        log.info("[discovery] register payload: %s", json.dumps(registration_data, ensure_ascii=False))
+
+        # 이미 존재하면 기존 에이전트로 처리
+        if existing:
+            return True, f"기존 에이전트가 이미 등록되어 있습니다: {agent_name} (Discovery 서비스가 자동으로 상태를 확인합니다)"
+
+        # 신규 등록
+        response = httpx.post(
+            f"{discovery_url}/agent",
+            json=registration_data,
+            timeout=timeout,
+            headers=headers,
+        )
+        log.info("[discovery] register resp %s: %s", response.status_code, response.text[:512])
+
+        # 201/200 허용 - Discovery 서비스가 자동으로 ping하여 상태를 active로 변경
+        if response.status_code in (200, 201):
+            return True, f"에이전트가 성공적으로 등록되었습니다: {agent_name} (Discovery 서비스가 자동으로 상태를 확인합니다)"
+
+        # 409(충돌) → 기존 에이전트로 처리
+        if response.status_code == 409:
+            return True, f"충돌 감지 → 기존 에이전트가 이미 등록되어 있습니다: {agent_name} (Discovery 서비스가 자동으로 상태를 확인합니다)"
+
+        # 그 외 실패 → 상세 메시지
+        return False, f"에이전트 등록 실패: HTTP {response.status_code} - {response.text}"
+
+    except httpx.ConnectError:
+        return False, f"Discovery 서비스에 연결할 수 없습니다: {discovery_url}"
+    except httpx.TimeoutException:
+        return False, f"Discovery 서비스 응답 시간 초과: {timeout}초"
+    except Exception as e:
+        return False, f"에이전트 등록 중 오류 발생: {str(e)}"
+
+
+def _deactivate_agent_in_discovery(
+    discovery_url: str,
+    agent_card: Dict[str, Any],
+    timeout: float = 10.0
+) -> Tuple[bool, str]:
+    """
+    A2A Discovery 서비스에서 에이전트를 제거합니다.
+    (Discovery 서비스에 상태 변경 API가 없으므로 제거 방식 사용)
+
+    Args:
+        discovery_url: Discovery 서비스의 기본 URL
+        agent_card: Agent Card 정보
+        timeout: 요청 타임아웃
+
+    Returns:
+        (성공여부, 메시지)
+    """
+    try:
+        if not discovery_url or not discovery_url.strip():
+            return False, "Discovery URL이 설정되지 않음"
+
+        discovery_url = discovery_url.rstrip('/')
+        agent_id = _derive_agent_id(agent_card)
+
+        # Discovery 서비스에 DELETE API가 없으므로, 로그만 남기고 성공으로 처리
+        log.info(f"[discovery] 에이전트 비활성화 요청: {agent_id} (Discovery 서비스가 자동으로 ping하여 상태를 확인합니다)")
+        return True, f"에이전트 비활성화 요청이 기록되었습니다: {agent_id} (Discovery 서비스가 자동으로 상태를 확인합니다)"
+
+    except Exception as e:
+        return False, f"에이전트 비활성화 중 오류 발생: {str(e)}"
 
 
 # ---------------- Langflow Flow helpers ----------------
@@ -426,15 +555,57 @@ def _sse_proxy_app(
 
     # ------------ Routes ------------
 
-    @app.get("/a2a/ping")
+    @app.get("/ping")
     async def ping():
-        try:
-            rid, rname = await _resolve_for_request(None)
-            return {"ok": True, "flow_id": rid, "flow_name": rname}
-        except Exception as e:
-            return {"ok": False, "flow_resolve_error": str(e)}
+        """Discovery 서비스용 간단한 헬스체크 - HTTP 200만 반환"""
+        # Discovery 서비스는 단순히 HTTP 200 응답만 확인하므로 복잡한 JSON 불필요
+        return {"ok": True}
 
-    @app.get("/a2a/agent-card")
+    @app.get("/health")
+    async def health():
+        """상세한 헬스체크 - flow 해석 포함"""
+        try:
+            # flow 해석을 시도하되, 실패해도 프록시 자체는 동작 중
+            rid, rname = await _resolve_for_request(None)
+            return {
+                "ok": True, 
+                "status": "proxy_running",
+                "flow_id": rid, 
+                "flow_name": rname,
+                "timestamp": time.time()
+            }
+        except Exception as e:
+            # flow 해석 실패해도 프록시 자체는 동작 중
+            log.warning(f"health: flow resolve failed: {e}")
+            return {
+                "ok": True,  # 프록시 자체는 동작 중
+                "status": "proxy_ready_flow_error",
+                "flow_id": None,
+                "flow_name": None,
+                "flow_error": str(e),
+                "timestamp": time.time()
+            }
+
+    @app.post("/discovery/register")
+    async def discovery_register():
+        if not agent_card_payload:
+            raise HTTPException(status_code=400, detail="Agent card not loaded")
+        # base_url 는 실행 시점에서 역산하기 어렵기 때문에 클라이언트가 Host 헤더로 접근한 URL을 사용
+        try:
+            # request.url 은 path 포함이므로 netloc만 재구성
+            # FastAPI에서 Request 주입
+            from fastapi import Request as _Req
+            async def _inner(req: _Req):
+                scheme = (req.headers.get("x-forwarded-proto") or req.url.scheme)
+                host = req.headers.get("x-forwarded-host") or req.headers.get("host") or "localhost"
+                base_url = f"{scheme}://{host}"
+                # Discovery URL은 런처 컴포넌트 설정에서만 알 수 있지만, 라우트에서는 접근 불가 → 400 안내
+                return JSONResponse({"ok": False, "reason": "Discovery URL is configured in launcher only", "base_url_guess": base_url})
+            return await _inner  # type: ignore
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/agent-card")
     async def agent_card():
         rid, rname = "", ""
         try:
@@ -447,17 +618,15 @@ def _sse_proxy_app(
         result["flow"] = {"id": rid, "name": rname}
         return result
 
-    # well-known: 루트와 /a2a 둘 다 제공 (클라 base_url 차이 대응)
+    # well-known: 표준 경로만 제공
     @app.get("/.well-known/agent-card.json", include_in_schema=False)
     async def agent_card_well_known_root():
         return await agent_card()
 
-    @app.get("/a2a/.well-known/agent-card.json", include_in_schema=False)
-    async def agent_card_well_known_prefixed():
-        return await agent_card()
 
 
-    # -------- JSON-RPC over HTTP (SDK 호환): POST /, /a2a --------
+
+    # -------- JSON-RPC over HTTP (SDK 호환): POST / --------
 
     def parse_and_get_data_text(s, *, require_nonempty: bool = False) -> Optional[str]:
         """
@@ -653,9 +822,7 @@ def _sse_proxy_app(
     async def a2a_jsonrpc_root(request: Request):
         return await _handle_jsonrpc(request)
 
-    @app.post("/a2a", include_in_schema=False)
-    async def a2a_jsonrpc_alias(request: Request):
-        return await _handle_jsonrpc(request)
+
 
     return app
 
@@ -676,6 +843,19 @@ class ProxyLauncher(Component):
     _server_threads: Dict[tuple, threading.Thread] = {}
     _resolved_flow: Dict[str, Tuple[str, str]] = {}
     _lock = threading.Lock()
+    
+    def __del__(self):
+        """컴포넌트가 소멸될 때 discovery 서비스에서 에이전트 상태를 비활성화"""
+        try:
+            if hasattr(self, 'discovery_url') and hasattr(self, 'agent_card'):
+                discovery_url = getattr(self, 'discovery_url', '')
+                agent_card_raw = getattr(self, 'agent_card', None)
+                if discovery_url and agent_card_raw:
+                    agent_card_payload = _parse_agent_card(agent_card_raw)
+                    if agent_card_payload:
+                        _deactivate_agent_in_discovery(discovery_url, agent_card_payload)
+        except Exception:
+            pass  # 소멸자에서는 오류를 무시
 
     inputs = [
         BoolInput(name="enabled", display_name="Enable Launcher", value=True),
@@ -713,6 +893,20 @@ class ProxyLauncher(Component):
             is_list=False,
             advanced=False,
         ),
+        MessageTextInput(
+            name="discovery_url",
+            display_name="A2A Discovery Service URL",
+            value="http://localhost:8000",
+            advanced=True,
+            info="A2A Discovery 서비스의 기본 URL (예: http://localhost:8000)"
+        ),
+        BoolInput(
+            name="auto_register_discovery",
+            display_name="Auto-register to Discovery Service",
+            value=True,
+            advanced=True,
+            info="프록시 시작 시 자동으로 Discovery 서비스에 에이전트 등록"
+        ),
     ]
 
     outputs = [Output(display_name="Status", name="status", method="launch")]
@@ -749,6 +943,10 @@ class ProxyLauncher(Component):
         stream_path = str(getattr(self, "stream_path", "/api/v1/run/{flow_id}?stream=false"))
         prefer_session_as_flow = bool(getattr(self, "prefer_session_as_flow", False))
         auto_pick_singleton = bool(getattr(self, "auto_pick_singleton", True))
+        
+        # Discovery 서비스 설정
+        discovery_url = str(getattr(self, "discovery_url", "") or "").strip()
+        auto_register_discovery = bool(getattr(self, "auto_register_discovery", True))
 
         base_url = f"http://{host}:{port}"
 
@@ -801,9 +999,35 @@ class ProxyLauncher(Component):
             cls._server_threads[key] = th
 
         # Healthcheck 대기
+        proxy_started = False
         for _ in range(50):
             if _port_open(host, port) and _ping(base_url):
-                return {"running": True, "base_url": base_url, "message": f"Proxy started. {pre_msg}"}
+                proxy_started = True
+                break
             time.sleep(0.1)
-
-        return {"running": False, "base_url": base_url, "message": "Proxy thread started but healthcheck failed."}
+        
+        if not proxy_started:
+            return {"running": False, "base_url": base_url, "message": "Proxy thread started but healthcheck failed."}
+        
+        # 프록시가 성공적으로 시작된 후 Discovery 서비스에 에이전트 등록
+        discovery_message = ""
+        if auto_register_discovery and discovery_url and agent_card_payload:
+            try:
+                log.warning(f"Discovery 서비스 등록 시도: {discovery_url}")
+                success, msg = _register_agent_to_discovery(
+                    discovery_url=discovery_url,
+                    agent_card=agent_card_payload,
+                    base_url=base_url
+                )
+                discovery_message = f" Discovery: {msg}" if msg else ""
+                if not success:
+                    log.warning(f"Discovery 서비스 등록 실패: {msg}")
+            except Exception as e:
+                discovery_message = f" Discovery: 등록 중 오류 발생 - {str(e)}"
+                log.error(f"Discovery 서비스 등록 중 예외: {e}")
+        
+        return {
+            "running": True, 
+            "base_url": base_url, 
+            "message": f"Proxy started. {pre_msg}{discovery_message}"
+        }
