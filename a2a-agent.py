@@ -3,14 +3,12 @@ import asyncio
 from typing import List, Dict, Any, Optional
 import aiohttp
 from uuid import uuid4
-from langchain_core.tools import StructuredTool
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import JsonOutputParser
 
 
 from langflow.base.agents.agent import LCToolsAgentComponent
-from langflow.base.agents.events import ExceptionWithMessageError
 from langflow.base.models.model_input_constants import (
     ALL_PROVIDER_FIELDS,
     MODEL_DYNAMIC_UPDATE_FIELDS,
@@ -18,8 +16,6 @@ from langflow.base.models.model_input_constants import (
     MODEL_PROVIDERS_DICT,
     MODELS_METADATA,
 )
-from langflow.base.models.model_utils import get_model_name
-from langflow.components.helpers.current_date import CurrentDateComponent
 from langflow.components.helpers.memory import MemoryComponent
 from langflow.components.langchain_utilities.tool_calling import ToolCallingAgentComponent
 from langflow.custom.custom_component.component import _get_component_toolkit
@@ -694,6 +690,7 @@ class A2AAgentComponent(ToolCallingAgentComponent):
 
         # LangChain이 이해할 수 있는 형식으로 메시지 변환
         user_task = self.input_value.content if hasattr(self.input_value, 'content') else str(self.input_value)
+        self.user_task = user_task  # 인스턴스 변수로 저장
         
         # LLM이 있는지 확인하고 없으면 기본 계획 반환
         if not hasattr(self, 'llm') or self.llm is None:

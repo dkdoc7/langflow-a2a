@@ -4,6 +4,7 @@ import uuid
 from langflow.custom.custom_component.component import Component
 from langflow.io import MessageTextInput, Output, HandleInput
 from langflow.schema.message import Message
+from langflow.logging import logger as log
 
 
 def _parse_list(value: Optional[str]) -> List[str]:
