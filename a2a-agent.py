@@ -415,6 +415,92 @@ class A2AAgentComponent(ToolCallingAgentComponent):
         else:
             return "일반 작업 처리"
 
+    def _extract_text_from_agent_response(self, agent_response: Dict[str, Any]) -> str:
+        """A2A 에이전트 응답에서 실제 텍스트를 추출하는 헬퍼 함수"""
+        try:
+            # 1. 표준 A2A 응답 구조 확인
+            if isinstance(agent_response, dict) and "result" in agent_response:
+                response_content = agent_response["result"]
+                if isinstance(response_content, dict) and "parts" in response_content:
+                    for part in response_content["parts"]:
+                        if part.get("kind") == "text":
+                            return part.get("text", "")
+            
+            # 2. Langflow 응답 구조 확인 (outputs -> results -> message -> text)
+            if isinstance(agent_response, dict) and "outputs" in agent_response:
+                outputs = agent_response["outputs"]
+                if isinstance(outputs, list) and outputs:
+                    first_output = outputs[0]
+                    if isinstance(first_output, dict) and "results" in first_output:
+                        results = first_output["results"]
+                        if isinstance(results, dict) and "message" in results:
+                            message = results["message"]
+                            if isinstance(message, dict) and "text" in message:
+                                return message["text"]
+            
+            # 3. 중첩된 outputs 구조 확인
+            if isinstance(agent_response, dict):
+                # 재귀적으로 텍스트 찾기
+                def find_text_recursive(obj, max_depth=5):
+                    if max_depth <= 0:
+                        return None
+                    
+                    if isinstance(obj, dict):
+                        # text 키가 있으면 반환
+                        if "text" in obj and isinstance(obj["text"], str):
+                            return obj["text"]
+                        # 재귀적으로 검색
+                        for value in obj.values():
+                            result = find_text_recursive(value, max_depth - 1)
+                            if result:
+                                return result
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            result = find_text_recursive(item, max_depth - 1)
+                            if result:
+                                return result
+                    return None
+                
+                found_text = find_text_recursive(agent_response)
+                if found_text:
+                    return found_text
+            
+            # 4. JSON 문자열로 변환해서 텍스트 찾기
+            import json
+            json_str = json.dumps(agent_response, ensure_ascii=False)
+            # 간단한 텍스트 패턴 찾기
+            import re
+            text_patterns = [
+                r'"text":\s*"([^"]+)"',
+                r'"message":\s*"([^"]+)"',
+                r'"content":\s*"([^"]+)"'
+            ]
+            
+            for pattern in text_patterns:
+                matches = re.findall(pattern, json_str)
+                if matches:
+                    # 가장 긴 텍스트 반환
+                    return max(matches, key=len)
+            
+            return ""
+            
+        except Exception as e:
+            logger.error(f"Error extracting text from agent response: {e}")
+            return ""
+
+    def _extract_user_text_from_task(self, user_task: str) -> str:
+        """사용자 요청에서 실제 텍스트만 추출하는 헬퍼 함수"""
+        try:
+            import json
+            # JSON 형태인지 확인
+            if user_task.strip().startswith('{'):
+                task_data = json.loads(user_task)
+                if isinstance(task_data, dict) and "text" in task_data:
+                    return task_data["text"]
+            return user_task
+        except Exception:
+            return user_task
+
     def format_final_result(self, work_plan: Dict[str, Any], final_result: Dict[str, Any]) -> str:
         """최종 결과를 사용자 친화적인 형태로 포맷팅"""
         
@@ -520,23 +606,23 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                                             result_text += "     ...\n"
                                             
                             elif "agent_response" in result_data:
-                                # A2A 에이전트 응답 (기존 로직)
+                                # A2A 에이전트 응답 개선된 파싱
                                 agent_response = result_data["agent_response"]
-                                if isinstance(agent_response, dict) and "result" in agent_response:
-                                    response_content = agent_response["result"]
-                                    if isinstance(response_content, dict) and "parts" in response_content:
-                                        for part in response_content["parts"]:
-                                            if part.get("kind") == "text":
-                                                text_content = part.get("text", "")
-                                                # 텍스트를 줄 단위로 나누어 처리
-                                                lines = text_content.strip().split('\n')
-                                                result_text += f"   • 실행 방법: 🤖 외부 에이전트\n"
-                                                result_text += f"   • 결과:\n"
-                                                for line in lines[:3]:  # 첫 3줄만 표시
-                                                    result_text += f"     {line.strip()}\n"
-                                                if len(lines) > 3:
-                                                    result_text += "     ...\n"
-                                                break
+                                extracted_text = self._extract_text_from_agent_response(agent_response)
+                                
+                                if extracted_text:
+                                    # 텍스트를 줄 단위로 나누어 처리
+                                    lines = extracted_text.strip().split('\n')
+                                    result_text += f"   • 실행 방법: 🤖 외부 에이전트\n"
+                                    result_text += f"   • 결과:\n"
+                                    for line in lines[:5]:  # 첫 5줄 표시
+                                        if line.strip():
+                                            result_text += f"     {line.strip()}\n"
+                                    if len(lines) > 5:
+                                        result_text += "     ...\n"
+                                else:
+                                    result_text += f"   • 실행 방법: 🤖 외부 에이전트\n"
+                                    result_text += f"   • 결과: 응답 파싱 실패\n"
                         elif isinstance(result_data, str):
                             # 단순 문자열 결과
                             lines = result_data.strip().split('\n')
@@ -570,9 +656,14 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             else:
                 result_text += f"🔄 작업이 진행 중입니다. ({completed_count}/{len(tasks)} 완료)\n"
             
-            # 사용자 요청 원문도 포함
+            # 사용자 요청 원문도 포함 (깔끔하게 정리)
             if hasattr(self, 'user_task') and self.user_task:
-                result_text += f"\n📝 **원본 요청**: {self.user_task}\n"
+                # JSON 형태의 user_task를 파싱해서 실제 텍스트만 추출
+                user_text = self._extract_user_text_from_task(self.user_task)
+                if user_text:
+                    result_text += f"\n📝 **원본 요청**: {user_text}\n"
+                else:
+                    result_text += f"\n📝 **원본 요청**: {self.user_task}\n"
             
             logger.info(f"format_final_result completed, length: {len(result_text)}")
             return result_text
