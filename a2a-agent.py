@@ -18,7 +18,7 @@ from langflow.base.models.model_input_constants import (
 )
 from langflow.components.helpers.memory import MemoryComponent
 from langflow.components.langchain_utilities.tool_calling import ToolCallingAgentComponent
-from langflow.custom.custom_component.component import _get_component_toolkit
+
 from langflow.custom.utils import update_component_build_config
 from langflow.field_typing import Tool
 from langflow.io import BoolInput, DropdownInput, HandleInput, IntInput, MultilineInput, Output, StrInput
@@ -83,10 +83,6 @@ def create_prompt_from_component(prompt_component, default_system_message: str =
         return None
 
 
-def set_advanced_true(component_input):
-    component_input.advanced = True
-    return component_input
-
 
 MODEL_PROVIDERS_LIST = ["Anthropic", "Google Generative AI", "Groq", "OpenAI"]
 
@@ -99,7 +95,7 @@ class A2AAgentComponent(ToolCallingAgentComponent):
     beta = False
     name = "A2A Agent"
 
-    memory_inputs = [set_advanced_true(component_input) for component_input in MemoryComponent().inputs]
+
 
     inputs = [
         # LLM 연결을 위한 입력 필드
@@ -264,10 +260,7 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                 sender_name=MESSAGE_SENDER_NAME_AI
             )
     
-    async def build_agent(self) -> Message:
-        """ToolCallingAgentComponent의 기본 메서드 오버라이드"""
-        logger.info("build_agent called - redirecting to main A2A agent")
-        return await self.message_response()
+
 
     async def _initialize_llm(self):
         """LLM 및 필수 속성 초기화"""
@@ -1845,29 +1838,5 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                     )
         return dotdict({k: v.to_dict() if hasattr(v, "to_dict") else v for k, v in build_config.items()})
 
-    async def _get_tools(self) -> list[Tool]:
-        component_toolkit = _get_component_toolkit()
-        tools_names = self._build_tools_names()
-        agent_description = self.get_tool_description()
-        # TODO: Agent Description Depreciated Feature to be removed
-        description = f"{agent_description}{tools_names}"
-        tools = component_toolkit(component=self).get_tools(
-            tool_name="Call_Agent", tool_description=description, callbacks=self.get_langchain_callbacks()
-        )
-        if hasattr(self, "tools_metadata"):
-            tools = component_toolkit(component=self, metadata=self.tools_metadata).update_tools_metadata(tools=tools)
-        return tools
 
-    async def build(self) -> Message:
-        """Langflow 컴포넌트의 메인 엔트리 포인트"""
-        try:
-            # A2A Agent 실행
-            result = await self.run_a2a_agent()
-            return result
-        except Exception as e:
-            logger.error(f"A2A Agent build error: {e}")
-            return Message(
-                text=f"A2A Agent 실행 중 오류가 발생했습니다: {str(e)}",
-                sender=MESSAGE_SENDER_AI,
-                sender_name=MESSAGE_SENDER_NAME_AI
-            )
+
