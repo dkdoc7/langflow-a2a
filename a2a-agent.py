@@ -156,14 +156,6 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             advanced=False,
             input_types=["Message"],
         ),
-        # Tools 연결을 위한 입력 필드
-        StrInput(
-            name="tools",
-            display_name="Tools",
-            info="에이전트가 사용할 도구들",
-            value="",   
-            advanced=True,
-        ),
         # Agent Description 입력 필드
         StrInput(
             name="agent_description",
@@ -235,6 +227,14 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             input_types=["Message"],
             required=True,
         ),
+         HandleInput(
+            name="tools",
+            display_name="Tools",
+            input_types=["Tool"],
+            is_list=True,
+            required=False,
+            info="These are the tools that the agent can use to help with tasks.",
+        ),
 
     ]
     outputs = [
@@ -291,11 +291,9 @@ class A2AAgentComponent(ToolCallingAgentComponent):
         try:
             # 1. A2A Discovery 서비스에서 사용 가능한 에이전트 목록 조회
             available_agents = await self.get_available_agents()
-            logger.info(f"Available agents: {len(available_agents)} agents found")
 
             # 2. 작업 분석 및 계획 수립
             work_plan = await self.create_work_plan(available_agents)
-            logger.info(f"Work plan created with {len(work_plan.get('work_breakdown', []))} tasks")
 
             # 3. Planning-Dispatcher-Critic 사이클 실행
             final_result = await self.execute_planning_dispatcher_critic_cycle(work_plan, available_agents)
@@ -303,8 +301,6 @@ class A2AAgentComponent(ToolCallingAgentComponent):
 
             # 4. 최종 결과 정리 및 반환
             user_friendly_result = self.format_final_result(work_plan, final_result)
-            logger.info(f"Formatted result length: {len(user_friendly_result)}")
-            logger.info(f"First 100 chars: {user_friendly_result[:100]}")
             
             # 결과가 비어있는 경우 백업 메시지 제공
             if not user_friendly_result or len(user_friendly_result.strip()) == 0:
@@ -501,6 +497,17 @@ class A2AAgentComponent(ToolCallingAgentComponent):
         except Exception:
             return user_task
 
+    def _log_work_breakdown(self, work_plan: Dict[str, Any]) -> None:
+        """작업 계획의 작업 목록을 로그로 출력하는 헬퍼 함수"""
+        if "work_breakdown" in work_plan:
+            tasks = work_plan["work_breakdown"]
+            logger.info(f"수립된 작업 목록 ({len(tasks)}개):")
+            for i, task in enumerate(tasks, 1):
+                title = task.get("title", f"Task {task.get('id', 'Unknown')}")
+                outputs = task.get("outputs", [])
+                dod = task.get("dod", [])
+                logger.info(f"  {i}. {title}\r\n     출력: {', '.join(outputs)}\r\n     완료 기준: {', '.join(dod)}")
+
     def format_final_result(self, work_plan: Dict[str, Any], final_result: Dict[str, Any]) -> str:
         """최종 결과를 사용자 친화적인 형태로 포맷팅"""
         
@@ -681,21 +688,20 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                 async with session.get(api_url) as response:
                     if response.status == 200:
                         response_data = await response.json()
-                        logger.info(f"A2A Discovery response: {response_data}")
-                        
+                       
                         # A2A Discovery 서비스는 AgentListResponse 형태로 응답: {"agents": [...]}
                         if isinstance(response_data, dict) and 'agents' in response_data:
                             agents = response_data['agents']
-                            logger.info(f"Successfully retrieved {len(agents)} agents from A2A Discovery service")
+                            logger.info(f"A2A Discovery : Found {len(agents)} available agents.")
                             return agents
                         else:
-                            logger.warning(f"Unexpected response format from A2A Discovery service: {type(response_data)}")
+                            logger.warning(f"A2A Discovery : Unexpected response format from A2A Discovery service: {type(response_data)}")
                             return []
                     else:
-                        logger.warning(f"Failed to get agents from A2A Discovery service: {response.status}")
+                        logger.warning(f"FA2A Discovery : ailed to get agents from A2A Discovery service: {response.status}")
                         return []
         except Exception as e:
-            logger.warning(f"Error connecting to A2A Discovery service: {e}")
+            logger.warning(f"A2A Discovery : Error connecting to A2A Discovery service: {e}")
             return []
         
 
@@ -724,6 +730,7 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             "properties": {
                 "goal": {"type": "string", "description": "전체 목표"},
                 "assumptions": {"type": "array", "items": {"type": "string"}, "description": "가정사항들"},
+                "updated": {"type": "boolean", "description": "계획이 업데이트되었는지 여부"},
                 "work_breakdown": {
                     "type": "array",
                     "items": {
@@ -805,22 +812,10 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                 "chat_history": langchain_chat_history
             })
             
-            logger.info("Work plan created successfully")
-            
+            logger.info(f"Work plan created with {len(result.get('work_breakdown', []))} tasks")
+
             # 수립된 작업 제목들 출력
-            if "work_breakdown" in result:
-                tasks = result["work_breakdown"]
-                logger.info(f"수립된 작업 목록 ({len(tasks)}개):")
-                for i, task in enumerate(tasks, 1):
-                    title = task.get("title", f"Task {task.get('id', 'Unknown')}")
-                    outputs = task.get("outputs", [])
-                    dod = task.get("dod", [])
-                    logger.info(f"  {i}. {title}\r\n     출력: {', '.join(outputs)}\r\n     완료 기준: {', '.join(dod)}")
-            
-                # 디버깅: 전체 작업 구조 로그
-                logger.info(f"전체 작업 구조 디버깅:")
-                for i, task in enumerate(tasks, 1):
-                    logger.info(f"  Task {i} 상세: {task}")
+            self._log_work_breakdown(result)
             
             return result
             
@@ -828,10 +823,7 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             logger.error(f"Error creating work plan: {e}")
             raise
 
-    async def execute_planning_dispatcher_critic_cycle(
-        self, 
-        work_plan: Dict[str, Any], 
-        available_agents: List[Dict[str, Any]]
+    async def execute_planning_dispatcher_critic_cycle(self, work_plan: Dict[str, Any], available_agents: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Planning-Dispatcher-Critic 사이클을 실행하여 작업을 수행"""
         
@@ -847,52 +839,21 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             logger.info(f"Starting iteration {iteration + 1} of {max_iter}")
             
             try:
-                # 1. Planning: 현재 계획 검토 및 개선
-                proposed_improved_plan = await self.planning_phase(current_plan, available_agents)
-                
-                # Planning Phase 결과 검증
-                original_task_count = len(current_plan.get("work_breakdown", []))
-                improved_task_count = len(proposed_improved_plan.get("work_breakdown", []))
-                
-                if improved_task_count != original_task_count:
-                    logger.warning(f"Planning Phase가 작업 개수를 변경했습니다: {original_task_count} → {improved_task_count}")
-                    logger.warning("원본 계획을 유지합니다.")
-                    improved_plan = current_plan
-                else:
-                    improved_plan = proposed_improved_plan
-                
-                # 2. Dispatcher: 작업을 적절한 에이전트에게 위임
-                logger.info("Starting dispatcher phase...")
-                new_results = await self.dispatcher_phase(improved_plan, available_agents, execution_results)
+                # 1. Dispatcher: 작업을 적절한 에이전트에게 위임
+                task_id,new_results = await self.dispatcher_phase(current_plan, available_agents, execution_results)
                 execution_results.update(new_results)
-                logger.info(f"Dispatcher phase returned. Total execution results: {len(execution_results)}")
-                
-                # 3. Critic: 결과 분석 및 개선안 제시
-                logger.info("Starting critic phase...")
-                critique_result = await self.critic_phase(execution_results, improved_plan)
-                logger.info(f"Critic phase completed. Critique result: {critique_result}")
 
-                # 4. 다음 반복을 위한 계획 업데이트
-                proposed_plan = critique_result.get("updated_plan", improved_plan)
+                # 2. Critic: 결과 분석 및 완료 여부 판단
+                critique_result = await self.critic_phase(task_id, execution_results, current_plan)
+                logger.info(f"Critic phase completed. Analysis: {critique_result.get('analysis', 'N/A')}")
+                execution_results[task_id]["result"]["output_values"] = critique_result["output_values"]
                 
-                # 작업 ID 일관성 검증
-                current_task_ids = {task["id"] for task in improved_plan.get("work_breakdown", [])}
-                proposed_task_ids = {task["id"] for task in proposed_plan.get("work_breakdown", [])}
-                
-                # 이미 처리된 작업의 ID가 변경되었는지 확인
-                processed_task_ids = set(execution_results.keys())
-                id_conflicts = processed_task_ids - proposed_task_ids
-                
-                if id_conflicts:
-                    logger.warning(f"Critic이 이미 처리된 작업 ID를 변경했습니다: {id_conflicts}")
-                    logger.warning("기존 계획을 유지합니다.")
-                    current_plan = improved_plan
-                else:
-                    current_plan = proposed_plan
-                    
-                logger.info(f"Updated plan: {current_plan}")
+                # 3. 다음 반복을 위한 계획 유지 (Planning Phase 제거됨)
+                # current_plan은 그대로 유지
+                logger.info(f"Plan set for next iteration: {len(current_plan.get('work_breakdown', []))} tasks")
+                self._log_work_breakdown(current_plan)
 
-                # 5. 완료 조건 확인
+                # 4. 완료 조건 확인
                 if critique_result.get("is_complete", False):
                     logger.info(f"Task completed after {iteration + 1} iterations")
                     break
@@ -915,45 +876,11 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             "status": "completed" if iteration < max_iter else "max_iterations_reached"
         }
 
-    async def planning_phase(self, current_plan: Dict[str, Any], available_agents: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """계획 단계: 현재 계획을 검토하고 개선"""
-        
-        # Planning Prompt 필수 연결 확인
-        if not hasattr(self, 'planning_prompt') or not self.planning_prompt:
-            msg = "Planning Prompt가 연결되지 않았습니다. Prompt Template 컴포넌트를 연결해주세요."
-            logger.error(msg)
-            raise ValueError(msg)
-        
-        logger.info("Using external planning prompt from Prompt Component")
-        planning_prompt = create_prompt_from_component(
-            self.planning_prompt,
-            default_system_message="당신은 작업 계획을 검토하고 개선하는 계획 전문가입니다."
-        )
-        
-        if planning_prompt is None:
-            msg = "Planning Prompt 변환에 실패했습니다. 올바른 프롬프트 템플릿을 연결해주세요."
-            logger.error(msg)
-            raise ValueError(msg)
-        
-        # LLM이 있는지 확인하고 없으면 현재 계획 반환
-        if not hasattr(self, 'llm') or self.llm is None:
-            logger.warning("LLM not available for planning phase, using current plan")
-            return current_plan
-
-        try:
-            chain = planning_prompt | self.llm | JsonOutputParser()
-            result = await chain.ainvoke({
-                "current_plan": json.dumps(current_plan, ensure_ascii=False, indent=2),
-                "available_agents": json.dumps(available_agents, ensure_ascii=False, indent=2)
-            })
-            return result
-        except Exception as e:
-            logger.warning(f"Planning phase failed: {e}, using current plan")
-            return current_plan
-
     async def dispatcher_phase(self, plan: Dict[str, Any], available_agents: List[Dict[str, Any]], existing_results: Dict[str, Any] = None) -> Dict[str, Any]:
         """디스패처 단계: 작업을 적절한 에이전트에게 위임"""
         
+        logger.info("Starting dispatcher phase...")
+
         # 기존 결과가 있으면 사용, 없으면 빈 딕셔너리로 시작
         if existing_results is None:
             existing_results = {}
@@ -969,51 +896,45 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             task_id = task["id"]
             agent_id = task["agent"]
             
-            logger.info(f"Dispatcher: 작업 {task_id} 확인 중... (에이전트: {agent_id})")
+            logger.info(f"Dispatcher: 작업 {task_id} (에이전트: {agent_id})")
             
             # 이미 처리된 작업은 건너뛰기
             if task_id in existing_results:
                 logger.info(f"Task {task_id} already processed, skipping")
                 continue
                 
-            logger.info(f"Processing task {task_id} with agent {agent_id}")
             
             # 이전 작업 결과에서 현재 작업의 필요 출력이 이미 있는지 확인
             required_outputs = task.get("outputs", [])
+
             if required_outputs and existing_results:
-                available_outputs = self.extract_available_outputs(existing_results)
-                if all(output in available_outputs for output in required_outputs):
-                    logger.info(f"Task {task_id} 스킵: 필요한 출력 {required_outputs}이 이미 이전 작업에서 생성됨")
-                    # 이전 결과에서 해당 출력을 가져와서 결과로 설정
-                    combined_result = self.combine_previous_outputs(existing_results, required_outputs)
-                    new_execution_results[task_id] = {
-                        "status": "skipped",
-                        "result": combined_result,
-                        "agent": "previous_results",
-                        "reason": f"Required outputs {required_outputs} already available from previous tasks"
-                    }
-                    logger.info(f"Task {task_id} added as skipped: {new_execution_results[task_id]}")
-                    break
-            
+
+                #이번 task 산출물이 이전 작업에서 이미 도출 된 경우, 이번 task완료된 것으로 처리하고 critic 단계를 수행
+                task_outputs = await self.check_task_outputs_in_existing_results(task["outputs"], existing_results);
+                if task_outputs:  
+                    if task_outputs.get("found"):
+                        logger.info(f"Task {task_id} 스킵: 필요한 산출물이 이미 이전 작업에서 생성됨")
+                        new_execution_results[task_id] = {
+                            "status": "skipped",
+                            "result": task_outputs,
+                            "agent": "previous_results",
+                            "reason": task_outputs.get("message", "Required outputs already available")
+                        }
+                        break   
+                    
             try:
                 # 에이전트에게 작업 위임
                 if agent_id != "self":
-                    logger.info(f"Delegating task {task_id} to agent {agent_id}")
                     result = await self.delegate_task_to_agent(task, agent_id, available_agents)
-                    logger.info(f"Task {task_id} delegation result: {result}")
                 else:
                     # 직접 실행
-                    logger.info(f"Executing task {task_id} directly")
                     result = await self.execute_task_directly(task, existing_results)
-                    logger.info(f"Task {task_id} direct execution result: {result}")
                 
                 new_execution_results[task_id] = {
                     "status": "completed",
                     "result": result,
                     "agent": agent_id
                 }
-                
-                logger.info(f"Task {task_id} added to new_execution_results: {new_execution_results[task_id]}")
                 
                 # 한 번에 하나의 작업만 처리하고 반환 (PDC 사이클을 위해)
                 break
@@ -1033,146 +954,413 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             logger.info(f"Dispatcher: 처리할 새로운 작업이 없습니다. (총 {len(all_tasks)}개 작업 중 {len(existing_results)}개 완료)")
         
         logger.info(f"Dispatcher phase completed. Returning {len(new_execution_results)} new results")
-        return new_execution_results
+        return task_id, new_execution_results
 
-    def extract_available_outputs(self, execution_results: Dict[str, Any]) -> List[str]:
-        """이전 작업 결과에서 사용 가능한 출력 목록을 추출"""
-        available_outputs = []
-        
-        for task_id, result in execution_results.items():
-            if result.get("status") == "completed" and "agent_response" in result:
-                agent_response = result["agent_response"]
-                if "result" in agent_response and "parts" in agent_response["result"]:
-                    # 응답 텍스트에서 출력 유형을 추정
-                    for part in agent_response["result"]["parts"]:
-                        if "text" in part:
-                            text = part["text"].lower()
-                            # 일반적인 출력 패턴 감지
-                            if "단어" in text and ("수" in text or "개수" in text):
-                                available_outputs.append("단어 수")
-                                available_outputs.append("단어 목록")
-                            if "토큰" in text and ("수" in text or "개수" in text):
-                                available_outputs.append("토큰 수")
-                                available_outputs.append("토큰 목록")
-                            if "성격" in text or "감정" in text:
-                                available_outputs.append("문장 성격")
-        
-        logger.info(f"사용 가능한 출력: {available_outputs}")
-        return available_outputs
 
-    def combine_previous_outputs(self, execution_results: Dict[str, Any], required_outputs: List[str]) -> Dict[str, Any]:
-        """이전 작업 결과에서 필요한 출력들을 조합하여 반환"""
-        combined_result = {
-            "task_id": "combined_from_previous",
-            "agent_id": "result_combiner",
-            "status": "completed",
-            "timestamp": "2024-01-01T00:00:00Z",
-            "agent_response": {
-                "jsonrpc": "2.0",
-                "id": "combined",
-                "result": {
-                    "kind": "message",
-                    "messageId": str(uuid4()),
-                    "role": "agent",
-                    "parts": [{
-                        "kind": "text",
-                        "text": f"이전 작업 결과에서 필요한 출력 {required_outputs}을 조합했습니다. 원본 결과를 참조하세요."
-                    }]
-                }
+
+    async def check_task_outputs_in_existing_results(self, required_outputs: List[str], existing_results: Dict[str, Any]) -> Dict[str, Any]:
+        """현재 작업의 산출물이 이전 작업 결과에 이미 있는지 확인"""
+        
+        if not required_outputs or not existing_results:
+            return {}
+        
+        try:
+            logger.info(f"--------------------------------")
+            logger.info(f"check_task_outputs_in_existing_results: required_outputs: {required_outputs}")
+            logger.info(f"check_task_outputs_in_existing_results: existing_results: {existing_results}")
+            logger.info(f"--------------------------------")
+            # LLM을 이용하여 execution_results[task_id]["result"]["output_values"]에 required_outputs가 있는지 확인
+            prompt = f"""다음 산출물이 이전 작업 결과에 있는지 확인해주세요: {required_outputs}
+
+이전 작업 결과: {existing_results}
+
+반드시 다음 JSON 형식으로만 응답해주세요:
+{{
+    "found": true/false,
+    "message": "발견됨/발견되지 않음"
+}}"""
+            parser = JsonOutputParser()
+            chain = self.llm | parser
+            result = await chain.ainvoke([HumanMessage(content=prompt)])
+            logger.info(f"check_task_outputs_in_existing_results: result: {result}")    
+            return result
+        except Exception as e:
+            logger.error(f"check_task_outputs_in_existing_results 실행 중 예외 발생: {e}")
+            return {"error": str(e)}
+
+
+
+    async def _get_available_tools(self) -> List[Dict[str, Any]]:
+        """사용 가능한 도구 목록을 반환 (HandleInput으로 연결된 도구만)"""
+        tools = []
+        
+        # HandleInput으로 연결된 도구들만 사용
+        if hasattr(self, 'tools') and self.tools:
+            try:
+                # tools가 리스트인 경우
+                if isinstance(self.tools, list):
+                    for tool in self.tools:
+                        if hasattr(tool, 'name') and hasattr(tool, 'description'):
+                            tools.append({
+                                "name": tool.name,
+                                "description": tool.description,
+                                "capabilities": getattr(tool, 'capabilities', []),
+                                "tool_object": tool  # 실제 도구 객체도 저장
+                            })
+                        elif isinstance(tool, dict):
+                            tools.append({
+                                "name": tool.get("name", "unknown_tool"),
+                                "description": tool.get("description", "No description"),
+                                "capabilities": tool.get("capabilities", []),
+                                "tool_object": tool
+                            })
+                # tools가 단일 객체인 경우
+                elif hasattr(self.tools, 'name'):
+                    tools.append({
+                        "name": self.tools.name,
+                        "description": self.tools.description,
+                        "capabilities": getattr(self.tools, 'capabilities', []),
+                        "tool_object": self.tools
+                    })
+                else:
+                    logger.warning("연결된 도구의 형식을 인식할 수 없습니다.")
+                    
+            except Exception as e:
+                logger.warning(f"도구 정보 파싱 중 오류: {e}")
+        
+        logger.info(f"사용 가능한 도구: {len(tools)}개")
+        for tool in tools:
+            logger.info(f"  - {tool['name']}: {tool['description']}")
+        
+        return tools
+
+    async def _select_best_tool(self, task: Dict[str, Any], available_tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """LLM을 사용하여 작업에 가장 적합한 도구를 선택하고 적합도를 평가"""
+        
+        if not available_tools:
+            logger.warning("사용 가능한 도구가 없습니다.")
+            return {
+                "tool": None,
+                "fitness_score": 0.0,
+                "reasoning": "사용 가능한 도구가 없음"
             }
-        }
         
-        return combined_result
+        if not hasattr(self, 'llm') or self.llm is None:
+            logger.warning("LLM이 없어 도구 선택을 할 수 없습니다. 첫 번째 도구를 사용합니다.")
+            return {
+                "tool": available_tools[0],
+                "fitness_score": 0.5,
+                "reasoning": "LLM 없음 - 첫 번째 도구 사용"
+            }
+        
+        try:
+            from langchain_core.messages import HumanMessage
+            from langchain_core.output_parsers import JsonOutputParser
+            
+            # 도구 선택을 위한 프롬프트
+            tools_info = []
+            for i, tool in enumerate(available_tools):
+                tools_info.append(f"{i+1}. {tool['name']}: {tool['description']}")
+                if tool.get('capabilities'):
+                    tools_info.append(f"   기능: {', '.join(tool['capabilities'])}")
+            
+            prompt = f"""다음 작업에 가장 적합한 도구를 선택하고 적합도를 0-1 사이로 평가해주세요.
+
+작업 정보:
+- 제목: {task.get('title', '')}
+- 입력: {', '.join(task.get('inputs', []))}
+- 예상 출력: {', '.join(task.get('outputs', []))}
+
+사용 가능한 도구:
+{chr(10).join(tools_info)}
+
+다음 JSON 형식으로 응답해주세요:
+{{
+    "selected_tool_index": 1,
+    "fitness_score": 0.85,
+    "reasoning": "이 도구가 가장 적합한 이유를 설명"
+}}
+
+적합도 기준:
+- 0.9-1.0: 매우 적합 (거의 완벽한 매치)
+- 0.7-0.9: 적합 (좋은 매치)
+- 0.5-0.7: 보통 (어느 정도 적합)
+- 0.3-0.5: 부적합 (약간의 관련성)
+- 0.0-0.3: 매우 부적합 (관련성 없음)"""
+            
+            parser = JsonOutputParser()
+            chain = self.llm | parser
+            
+            result = await chain.ainvoke([HumanMessage(content=prompt)])
+            
+            # 결과 검증 및 처리
+            selected_index = result.get("selected_tool_index", 1) - 1  # 1-based to 0-based
+            fitness_score = float(result.get("fitness_score", 0.5))
+            reasoning = result.get("reasoning", "No reasoning provided")
+            
+            # 인덱스 범위 검증
+            if 0 <= selected_index < len(available_tools):
+                selected_tool = available_tools[selected_index]
+            else:
+                logger.warning(f"잘못된 도구 인덱스: {selected_index}, 기본 도구 사용")
+                selected_tool = available_tools[0] if available_tools else None
+                fitness_score = 0.5
+            
+            logger.info(f"도구 선택 결과: {selected_tool['name']} (적합도: {fitness_score:.2f})")
+            logger.info(f"선택 이유: {reasoning}")
+            
+            return {
+                "tool": selected_tool,
+                "fitness_score": fitness_score,
+                "reasoning": reasoning
+            }
+            
+        except Exception as e:
+            logger.error(f"도구 선택 중 오류 발생: {e}")
+            return {
+                "tool": available_tools[0] if available_tools else None,
+                "fitness_score": 0.5,
+                "reasoning": f"오류로 인한 기본 선택: {str(e)}"
+            }
+
+    async def _execute_with_selected_tool(self, task: Dict[str, Any], tool: Dict[str, Any], existing_results: Dict[str, Any] = None) -> Dict[str, Any]:
+        """선택된 도구를 사용하여 작업 실행"""
+        tool_name = tool.get("name", "unknown")
+        tool_object = tool.get("tool_object")
+        logger.info(f"도구 '{tool_name}'을 사용하여 작업 실행")
+        
+        try:
+            # 실제 도구 객체가 있는 경우 도구 실행
+            if tool_object:
+                # 사용자 입력 처리
+                user_input = self.input_value.content if hasattr(self.input_value, 'content') else str(self.input_value)
+                
+                # 도구 실행을 위한 입력 준비
+                tool_input = {
+                    "task": task,
+                    "user_input": user_input,
+                    "existing_results": existing_results
+                }
+                
+                # 도구가 호출 가능한지 확인
+                if callable(tool_object):
+                    # evaluate_expression 도구의 경우 특별 처리
+                    if tool_name == "evaluate_expression":
+                        if asyncio.iscoroutinefunction(tool_object):
+                            result = await tool_object(user_input)
+                        else:
+                            result = tool_object(user_input)
+                    else:
+                        # 도구가 함수인 경우
+                        if asyncio.iscoroutinefunction(tool_object):
+                            result = await tool_object(**tool_input)
+                        else:
+                            result = tool_object(**tool_input)
+                elif hasattr(tool_object, 'invoke'):
+                    # LangChain 도구인 경우
+                    try:
+                        # evaluate_expression 도구의 경우 특별 처리
+                        if tool_name == "evaluate_expression":
+                            if asyncio.iscoroutinefunction(tool_object.invoke):
+                                result = await tool_object.ainvoke(user_input)
+                            else:
+                                result = tool_object.invoke(user_input)
+                        else:
+                            if asyncio.iscoroutinefunction(tool_object.invoke):
+                                result = await tool_object.ainvoke(tool_input)
+                            else:
+                                result = tool_object.invoke(tool_input)
+                    except TypeError as e:
+                        # 도구가 tool_input 형식을 받지 못하는 경우, user_input만 전달
+                        logger.warning(f"도구 '{tool_name}'이 tool_input 형식을 받지 못함: {e}. user_input만 전달합니다.")
+                        if asyncio.iscoroutinefunction(tool_object.invoke):
+                            result = await tool_object.ainvoke(user_input)
+                        else:
+                            result = tool_object.invoke(user_input)
+                elif hasattr(tool_object, 'run'):
+                    # 다른 형태의 도구인 경우
+                    if asyncio.iscoroutinefunction(tool_object.run):
+                        result = await tool_object.run(user_input)
+                    else:
+                        result = tool_object.run(user_input)
+                else:
+                    logger.warning(f"도구 '{tool_name}'의 실행 방법을 찾을 수 없습니다.")
+                    return await self._fallback_to_direct_processing(task, user_input)
+                
+                # 도구 실행 결과를 표준 형식으로 변환
+                return {
+                    "task_id": task["id"],
+                    "execution_method": "tool_execution",
+                    "tool_used": tool_name,
+                    "status": "completed",
+                    "result": str(result) if result is not None else "No result",
+                    "raw_result": result
+                }
+            else:
+                logger.warning(f"도구 '{tool_name}'의 객체를 찾을 수 없습니다.")
+                return await self._fallback_to_direct_processing(task, self.input_value.content if hasattr(self.input_value, 'content') else str(self.input_value))
+                
+        except Exception as e:
+            logger.error(f"도구 '{tool_name}' 실행 중 오류 발생: {e}")
+            return {
+                "task_id": task["id"],
+                "execution_method": "tool_execution_error",
+                "tool_used": tool_name,
+                "status": "error",
+                "error": str(e),
+                "result": f"도구 실행 중 오류가 발생했습니다: {str(e)}"
+            }
+
+    async def _fallback_to_direct_processing(self, task: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+        """도구 실행 실패 시 직접 처리로 폴백"""
+        task_title = task.get("title", "")
+        logger.info(f"직접 처리로 폴백: {task_title}")
+        
+        # 작업 유형에 따른 직접 처리
+        if "분석" in task_title or "텍스트" in task_title:
+            return await self.handle_text_analysis_task(task, user_input)
+        elif "질문" in task_title or "답변" in task_title or "QA" in task_title:
+            return await self.handle_qa_task(task, user_input)
+        elif "요약" in task_title or "정리" in task_title:
+            return await self.handle_summary_task(task, user_input)
+        elif "생성" in task_title or "작성" in task_title:
+            return await self.handle_generation_task(task, user_input)
+        else:
+            return await self.handle_general_task(task, user_input)
+
+    async def _handle_math_calculation_task(self, task: Dict[str, Any], existing_results: Dict[str, Any] = None) -> Dict[str, Any]:
+        """수학 계산 작업 처리"""
+        task_id = task["id"]
+        task_title = task["title"]
+        
+        if existing_results:
+            # 이전 작업 결과에서 필요한 데이터 추출
+            word_count = None
+            token_count = None
+            
+            for prev_task_id, prev_result in existing_results.items():
+                if prev_result.get("status") == "completed":
+                    result_data = prev_result.get("result", {})
+                    if isinstance(result_data, dict) and "agent_response" in result_data:
+                        # A2A 에이전트 응답에서 데이터 추출
+                        agent_response = result_data["agent_response"]
+                        if isinstance(agent_response, dict) and "result" in agent_response:
+                            response_text = agent_response["result"]
+                            if isinstance(response_text, dict) and "parts" in response_text:
+                                for part in response_text["parts"]:
+                                    if part.get("kind") == "text":
+                                        text_content = part.get("text", "")
+                                        # 텍스트에서 단어 수와 토큰 수 추출
+                                        import re
+                                        word_match = re.search(r'단어.*?(\d+)', text_content)
+                                        token_match = re.search(r'토큰.*?(\d+)', text_content)
+                                        
+                                        if word_match:
+                                            word_count = int(word_match.group(1))
+                                        if token_match:
+                                            token_count = int(token_match.group(1))
+            
+            if word_count is not None and token_count is not None:
+                import math
+                product = word_count * token_count
+                natural_log = math.log(product)
+                
+                result = {
+                    "task_id": task_id,
+                    "execution_method": "tool_math_calculation",
+                    "tool_used": "math_calculator",
+                    "inputs": {
+                        "word_count": word_count,
+                        "token_count": token_count
+                    },
+                    "calculation": {
+                        "product": product,
+                        "natural_log": natural_log
+                    },
+                    "result": f"단어 수({word_count}) × 토큰 수({token_count}) = {product}, ln({product}) = {natural_log:.6f}"
+                }
+                logger.info(f"수학 계산 완료: {result['result']}")
+                return result
+            else:
+                logger.warning(f"이전 작업 결과에서 단어 수({word_count}) 또는 토큰 수({token_count})를 찾을 수 없습니다.")
+        else:
+            logger.warning("수학 계산을 위한 이전 작업 결과가 없습니다.")
+        
+        # 수학 계산이 불가능한 경우 기본 처리
+        return await self.handle_general_task(task, self.input_value.content if hasattr(self.input_value, 'content') else str(self.input_value))
 
     async def execute_task_directly(self, task: Dict[str, Any], existing_results: Dict[str, Any] = None) -> Dict[str, Any]:
-        """직접 실행: 수학 계산 등 내장 기능으로 처리 가능한 작업"""
+        """직접 실행: LLM을 이용한 도구 선택 및 실행"""
         
         task_id = task["id"]
         task_title = task["title"]
         task_inputs = task.get("inputs", [])
         task_outputs = task.get("outputs", [])
         
-        logger.info(f"직접 실행 작업: {task_title}")
-        logger.info(f"필요한 입력: {task_inputs}")
-        logger.info(f"기대 출력: {task_outputs}")
+        logger.info(f"Task({task_title}) directly execute with tool selection.\r\n inputs: {task_inputs}\r\n expected: {task_outputs}")
         
-        # 수학 계산 작업 처리
-        if "수학 계산" in task_title or "곱셈" in task_title or "자연로그" in task_title:
-            if existing_results:
-                # 이전 작업 결과에서 필요한 데이터 추출
-                word_count = None
-                token_count = None
-                
-                for prev_task_id, prev_result in existing_results.items():
-                    if prev_result.get("status") == "completed":
-                        result_data = prev_result.get("result", {})
-                        if isinstance(result_data, dict) and "agent_response" in result_data:
-                            # A2A 에이전트 응답에서 데이터 추출
-                            agent_response = result_data["agent_response"]
-                            if isinstance(agent_response, dict) and "result" in agent_response:
-                                response_text = agent_response["result"]
-                                if isinstance(response_text, dict) and "parts" in response_text:
-                                    for part in response_text["parts"]:
-                                        if part.get("kind") == "text":
-                                            text_content = part.get("text", "")
-                                            # 텍스트에서 단어 수와 토큰 수 추출
-                                            import re
-                                            word_match = re.search(r'단어.*?(\d+)', text_content)
-                                            token_match = re.search(r'토큰.*?(\d+)', text_content)
-                                            
-                                            if word_match:
-                                                word_count = int(word_match.group(1))
-                                            if token_match:
-                                                token_count = int(token_match.group(1))
-                
-                if word_count is not None and token_count is not None:
-                    import math
-                    product = word_count * token_count
-                    natural_log = math.log(product)
-                    
-                    result = {
-                        "task_id": task_id,
-                        "execution_method": "direct_calculation",
-                        "inputs": {
-                            "word_count": word_count,
-                            "token_count": token_count
-                        },
-                        "calculation": {
-                            "product": product,
-                            "natural_log": natural_log
-                        },
-                        "result": f"단어 수({word_count}) × 토큰 수({token_count}) = {product}, ln({product}) = {natural_log:.6f}"
-                    }
-                    logger.info(f"수학 계산 완료: {result['result']}")
-                    return result
-                else:
-                    logger.warning(f"이전 작업 결과에서 단어 수({word_count}) 또는 토큰 수({token_count})를 찾을 수 없습니다.")
-            else:
-                logger.warning("수학 계산을 위한 이전 작업 결과가 없습니다.")
-        
-        # 일반적인 작업 처리
         try:
-            # 사용자 입력 처리
-            user_input = self.input_value.content if hasattr(self.input_value, 'content') else str(self.input_value)
+            # 1. 사용 가능한 도구 목록 가져오기
+            available_tools = await self._get_available_tools()
+            logger.info(f"사용 가능한 도구: {len(available_tools)}개")
             
-            # 작업 유형에 따른 처리
-            if "분석" in task_title or "텍스트" in task_title:
-                return await self.handle_text_analysis_task(task, user_input)
-            elif "질문" in task_title or "답변" in task_title or "QA" in task_title:
-                return await self.handle_qa_task(task, user_input)
-            elif "요약" in task_title or "정리" in task_title:
-                return await self.handle_summary_task(task, user_input)
-            elif "생성" in task_title or "작성" in task_title:
-                return await self.handle_generation_task(task, user_input)
+            # 도구가 없는 경우 직접 처리
+            if not available_tools:
+                logger.info("연결된 도구가 없어 직접 처리합니다.")
+                user_input = self.input_value.content if hasattr(self.input_value, 'content') else str(self.input_value)
+                result = await self._fallback_to_direct_processing(task, user_input)
+                
+                # 결과에 직접 처리 정보 추가
+                if isinstance(result, dict):
+                    result["tool_selection"] = {
+                        "tool_used": "direct_processing",
+                        "fitness_score": 0.0,
+                        "reasoning": "연결된 도구가 없어 직접 처리"
+                    }
+                
+                return result
+            
+            # 2. LLM을 사용하여 가장 적합한 도구 선택
+            tool_selection = await self._select_best_tool(task, available_tools)
+            selected_tool = tool_selection["tool"]
+            fitness_score = tool_selection["fitness_score"]
+            reasoning = tool_selection["reasoning"]
+            
+            # 3. 적합도가 0.7 이상인 경우 도구 사용, 그렇지 않으면 직접 처리
+            if fitness_score >= 0.7 and selected_tool:
+                logger.info(f"도구 사용 결정: {selected_tool['name']} (적합도: {fitness_score:.2f})")
+                result = await self._execute_with_selected_tool(task, selected_tool, existing_results)
+                
+                # 결과에 도구 정보 추가
+                if isinstance(result, dict):
+                    result["tool_selection"] = {
+                        "tool_used": selected_tool["name"],
+                        "fitness_score": fitness_score,
+                        "reasoning": reasoning
+                    }
+                
+                return result
             else:
-                # 기본 처리: LLM을 사용한 일반적인 대응
-                return await self.handle_general_task(task, user_input)
+                logger.info(f"도구 사용 거부: 적합도 {fitness_score:.2f} < 0.7, 직접 처리")
+                # 직접 처리
+                user_input = self.input_value.content if hasattr(self.input_value, 'content') else str(self.input_value)
+                result = await self._fallback_to_direct_processing(task, user_input)
+                
+                # 결과에 직접 처리 정보 추가
+                if isinstance(result, dict):
+                    result["tool_selection"] = {
+                        "tool_used": "direct_processing",
+                        "fitness_score": fitness_score,
+                        "reasoning": f"적합도 부족으로 직접 처리: {reasoning}"
+                    }
+                
+                return result
                 
         except Exception as e:
             logger.error(f"작업 실행 중 오류 발생: {e}")
             return {
                 "task_id": task_id,
-                "execution_method": "direct",
+                "execution_method": "direct_with_error",
                 "status": "error",
                 "error": str(e),
                 "result": f"작업 '{task_title}' 실행 중 오류가 발생했습니다: {str(e)}"
@@ -1396,49 +1584,224 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             "task_description": task_description,
             "user_input": user_input,
             "result": f"🔧 작업: {task_description}\n📝 입력: {user_input}\n\n✅ 기본 처리 결과:\n{result_content}"
-        }
+                }
+
+    def find_parts(self, obj: Dict[str, Any]) -> list[Dict[str, Any]]:
+        """
+        JSON(dict/list) 구조 내부를 재귀적으로 탐색하여 
+        'parts' 필드로 지정된 내용을 모두 찾아 리스트로 반환하는 함수
+        """
+        results = []
+
+        if isinstance(obj, dict):
+            # 현재 dict에 'parts' 키가 있으면 추가
+            if "parts" in obj:
+                parts_content = obj["parts"]
+                # parts가 이미 리스트이면 그대로 추가, 아니면 리스트로 변환
+                if isinstance(parts_content, list):
+                    results.extend(parts_content)
+                else:
+                    results.append(parts_content)
+
+            # 재귀적으로 모든 값들을 탐색
+            for value in obj.values():
+                results.extend(self.find_parts(value))
+
+        elif isinstance(obj, list):
+            # 리스트의 각 항목을 재귀적으로 탐색
+            for item in obj:
+                results.extend(self.find_parts(item))
+
+        return results
+
+    def _find_value_recursive(self, obj: Any, target_key: str, default_value: Any = None) -> Any:
+        """
+        중첩된 dict/list 구조에서 특정 키의 값을 재귀적으로 찾는 함수
+        
+        Args:
+            obj: 탐색할 객체 (dict, list, 또는 기타)
+            target_key: 찾을 키 이름
+            default_value: 찾지 못했을 때 반환할 기본값
+            
+        Returns:
+            찾은 값 또는 기본값
+        """
+        if isinstance(obj, dict):
+            # 현재 dict에 타겟 키가 있으면 반환
+            if target_key in obj:
+                return obj[target_key]
+            
+            # 모든 값들을 재귀적으로 탐색
+            for value in obj.values():
+                result = self._find_value_recursive(value, target_key, default_value)
+                if result is not default_value:
+                    return result
+                    
+        elif isinstance(obj, list):
+            # 리스트의 각 요소를 순서대로 탐색
+            for item in obj:
+                result = self._find_value_recursive(item, target_key, default_value)
+                if result is not default_value:
+                    return result
+        
+        return default_value
+
+    def _extract_session_id(self, parts: list) -> str:
+        """parts에서 session_id를 재귀적으로 추출"""
+        if not parts:
+            return "unknown"
+        
+        result = self._find_value_recursive(parts, "session_id", "unknown")
+        return result if result != "unknown" else "unknown"
+
+    def _extract_input_text(self, parts: list) -> str:
+        """parts에서 input_value를 재귀적으로 추출"""
+        if not parts:
+            return "unknown"
+        
+        result = self._find_value_recursive(parts, "input_value", "unknown")
+        return result if result != "unknown" else "unknown"
+
+    def _extract_analysis_text(self, parts: list) -> str:
+        """parts에서 최종 텍스트를 재귀적으로 추출"""
+        if not parts:
+            return None
+        
+        # message.data.text 경로를 따라 찾기
+        result = self._find_value_recursive(parts, "data", None)
+        
+        text = ""
+        if  result:
+            text=result["text"]
+
+        return text
+
+    def extract_text_from_agent_response(self, agent_response: Dict[str, Any]) -> Dict[str, Any]:
+        """A2A 에이전트 응답에서 실제 텍스트를 추출하는 헬퍼 함수"""
+        try:
+            # agent_response가 이미 dict인 경우
+            if isinstance(agent_response, dict):
+                obj = agent_response
+            # agent_response가 문자열인 경우 JSON 파싱
+            elif isinstance(agent_response, str):
+                if agent_response.strip().startswith('{'):
+                    obj = json.loads(agent_response)
+                else:
+                    logger.warning("Agent response is not a valid JSON string")
+                    return None
+            else:
+                logger.warning(f"Unexpected agent_response type: {type(agent_response)}")
+                return None
+            
+            # JSON 구조에서 중첩된 JSON 문자열 파싱
+            obj = self._parse_nested_json_strings(obj)
+            
+            # parts 필드들 찾기
+            parts = self.find_parts(obj)
+            
+            if len(parts) == 0:
+                logger.warning("No message fields found in agent response")
+                return None
+
+            #logger.info(f"agent_response parts: {parts[0]}") 
+            
+            # 안전한 데이터 추출
+            try:
+                session_id = self._extract_session_id(parts)
+                input_text = self._extract_input_text(parts)
+                analysis_text = self._extract_analysis_text(parts)
+                
+                logger.info(f"session_id: {session_id}")
+                logger.info(f"input_text: {input_text}")
+                logger.info(f"analysis_text: {analysis_text}")
+                
+            except Exception as e:
+                logger.error(f"Error extracting data from parts: {e}")
+                logger.error(f"Parts structure: {parts}")
+                return None 
+            
+            if not analysis_text:
+                logger.warning("No meaningful text content found in messages")
+                return None
+               
+            return {
+                "session_id": session_id,
+                "input_text": input_text,
+                "analysis_text": analysis_text
+            }
+        except Exception as e:
+            logger.error(f"Error extracting text from agent response: {e}")
+            return None
+
+    def _parse_nested_json_strings(self, obj):
+        """중첩된 JSON 문자열을 재귀적으로 파싱"""
+        if isinstance(obj, dict):
+            result = {}
+            for key, value in obj.items():
+                if isinstance(value, str) and value.strip().startswith('{'):
+                    try:
+                        result[key] = self._parse_nested_json_strings(json.loads(value))
+                    except json.JSONDecodeError:
+                        result[key] = value
+                else:
+                    result[key] = self._parse_nested_json_strings(value)
+            return result
+        elif isinstance(obj, list):
+            return [self._parse_nested_json_strings(item) for item in obj]
+        else:
+            return obj
+
+    def _extract_best_text_from_messages(self, msgs):
+        """메시지 리스트에서 가장 유용한 텍스트를 추출"""
+        for msg in msgs:
+            if not isinstance(msg, dict):
+                continue
+                
+            # 우선순위 1: data.text (가장 구조화된 텍스트)
+            if "data" in msg and isinstance(msg["data"], dict) and "text" in msg["data"]:
+                text = msg["data"]["text"]
+                if text and len(text.strip()) > 10:  # 의미있는 텍스트인지 확인
+                    return text
+            
+            # 우선순위 2: text (직접 텍스트)
+            if "text" in msg:
+                text = msg["text"]
+                if text and len(text.strip()) > 10:
+                    return text
+            
+            # 우선순위 3: content (래핑된 텍스트)
+            if "content" in msg:
+                content = msg["content"]
+                if content and len(str(content).strip()) > 10:
+                    return str(content)
+        
+        return None
 
     async def delegate_task_to_agent(self, task: Dict[str, Any], agent_id: str, available_agents: List[Dict[str, Any]]) -> Dict[str, Any]:
         """특정 에이전트에게 작업을 위임"""
         
         logger.info(f"Delegating task {task['id']} to agent {agent_id}")
-        logger.info(f">> Task : {task['title']}")
-        logger.info(f">> Task Debug: {task}")  # 디버깅: 전체 task 정보 출력
         
-        logger.info(f">> Available Agents : {len(available_agents)}")
-        
-        # 계획에서 이미 할당된 에이전트를 직접 매칭 (에이전트 평가 단계는 Work Plan에서 완료됨)
-        logger.info(f"Finding pre-assigned agent: {agent_id}")
         target_agent = None
         
         for agent in available_agents:
             if agent.get("id") == agent_id:
                 target_agent = agent
-                logger.info(f"Found target agent: {agent.get('name', agent_id)}")
                 break
         
         if not target_agent:
-            logger.error(f"Pre-assigned agent '{agent_id}' not found in available agents")
-            return {
-                "task_id": task["id"],
-                "agent_id": agent_id,
-                "status": "failed",
-                "error": f"Pre-assigned agent '{agent_id}' not found in available agents",
-                "timestamp": "2024-01-01T00:00:00Z"
-            }
+            raise ValueError(f"Pre-assigned agent '{agent_id}' not found in available agents")
         
         # 에이전트 URL 확인 및 변환
         agent_url = target_agent.get("url") or target_agent.get("endpoint")
         if not agent_url:
             agent_name = target_agent.get("name", target_agent.get("id", "Unknown"))
             msg = f"선택된 에이전트 '{agent_name}' (ID: {target_agent.get('id', 'Unknown')})에 URL이 지정되지 않았습니다. 에이전트 설정을 확인해주세요."
-            logger.error(msg)
             raise ValueError(msg)
         
         # 0.0.0.0을 127.0.0.1로 변환 (클라이언트 호출용)
         if "0.0.0.0" in agent_url:
             agent_url = agent_url.replace("0.0.0.0", "127.0.0.1")
-            logger.info(f"Converted 0.0.0.0 to 127.0.0.1: {agent_url}")
         
         # A2A 프로토콜에 맞는 실제 API 호출
         try:
@@ -1470,9 +1833,6 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                 "Accept": "application/json",
                 "User-Agent": "A2A-Agent-Component/1.0"
             }
-            
-            logger.info(f"A2A RPC payload: {a2a_rpc_payload}")
-            
             # A2A 표준 API 호출
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -1481,47 +1841,27 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as response:
-                    
-                    logger.info(f"A2A API response status: {response.status}")
-                    
+                                       
                     if response.status == 200:
                         try:
-                            result_data = await response.json()
                             logger.info(f"Task {task['id']} successfully delegated to agent {agent_id}")
+                            result_data = await response.json()
+                            extracted_data = self.extract_text_from_agent_response(result_data)
                             
-                            # JSON-RPC 2.0 응답 구조 처리
-                            if "result" in result_data:
-                                rpc_result = result_data["result"]
-                                # 응답 수신 확인 로그
-                                logger.info(f"Agent response received from {agent_id}")
+                            # extract_text_from_agent_response가 None을 반환한 경우 원본 데이터 사용
+                            if extracted_data is None:
+                                raise Exception("Failed to extract text from agent response")
                                 
-                                final_result = {
+                            return {
                                     "task_id": task["id"],
                                     "agent_id": agent_id,
                                     "status": "completed",
                                     "timestamp": "2024-01-01T00:00:00Z",
-                                    "agent_response": result_data
+                                    "session_id": extracted_data["session_id"],
+                                    "input_text": extracted_data["input_text"],
+                                    "message_text": extracted_data["analysis_text"]
                                 }
-                                return final_result
-                            elif "error" in result_data:
-                                logger.error(f"Found 'error' in response: {result_data['error']}")
-                                return {
-                                    "task_id": task["id"],
-                                    "agent_id": agent_id,
-                                    "status": "failed",
-                                    "error": f"RPC Error: {result_data['error']}",
-                                    "timestamp": "2024-01-01T00:00:00Z"
-                                }
-                            else:
-                                logger.warning(f"No 'result' or 'error' found in response, using raw data")
-                                return {
-                                    "task_id": task["id"],
-                                    "agent_id": agent_id,
-                                    "status": "completed",
-                                    "result": result_data,
-                                    "timestamp": "2024-01-01T00:00:00Z",
-                                    "agent_response": result_data
-                                }
+
                         except Exception as json_error:
                             logger.error(f"Error parsing JSON response: {json_error}")
                             response_text = await response.text()
@@ -1534,43 +1874,18 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                                 "timestamp": "2024-01-01T00:00:00Z"
                             }
                     else:
-                        error_text = await response.text()
-                        logger.error(f"Agent {agent_id} returned error: {response.status} - {error_text}")
-                        
-                        return {
-                            "task_id": task["id"],
-                            "agent_id": agent_id,
-                            "status": "failed",
-                            "error": f"Agent returned HTTP {response.status}: {error_text}",
-                            "timestamp": "2024-01-01T00:00:00Z"
-                        }
+                        raise Exception("Failed to extract text from agent response")
                         
         except asyncio.TimeoutError:
-            logger.error(f"Timeout while delegating task {task['id']} to agent {agent_id}")
-            return {
-                "task_id": task["id"],
-                "agent_id": agent_id,
-                "status": "timeout",
-                "error": "Request timeout",
-                "timestamp": "2024-01-01T00:00:00Z"
-            }
+            raise ValueError("Timeout while delegating task {task['id']} to agent {agent_id}")
         except Exception as e:
-            logger.error(f"Error delegating task {task['id']} to agent {agent_id}: {e}")
-            return {
-                "task_id": task["id"],
-                "agent_id": agent_id,
-                "status": "error",
-                "error": str(e),
-                "timestamp": "2024-01-01T00:00:00Z"
-            }
+            raise ValueError(f"Error delegating task {task['id']} to agent {agent_id}: {e}")
 
 
-
-    async def critic_phase(self, execution_results: Dict[str, Any], current_plan: Dict[str, Any]) -> Dict[str, Any]:
-        """비평 단계: 실행 결과를 분석하고 개선안 제시"""
+    async def critic_phase(self, task_id: str, execution_results: Dict[str, Any], current_plan: Dict[str, Any]) -> Dict[str, Any]:
+        """비평 단계: 실행 결과를 분석하고 완료 여부를 판단"""
         
-        logger.info("=== CRITIC PHASE STARTED ===")
-        logger.info(f"Analyzing {len(execution_results)} execution results")
+        logger.info("Critic Phase Start...")
         
         # Critic Prompt 필수 연결 확인
         if not hasattr(self, 'critic_prompt') or not self.critic_prompt:
@@ -1578,16 +1893,15 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             logger.error(msg)
             raise ValueError(msg)
         
-        logger.info("Using external critic prompt from Prompt Component for LLM-based analysis")
-        return await self._llm_based_critic(execution_results, current_plan)
+        return await self._llm_based_critic(task_id, execution_results, current_plan)
     
-    async def _llm_based_critic(self, execution_results: Dict[str, Any], current_plan: Dict[str, Any]) -> Dict[str, Any]:
-        """LLM 기반 비평 분석"""
+    async def _llm_based_critic(self, task_id: str, execution_results: Dict[str, Any], current_plan: Dict[str, Any]) -> Dict[str, Any]:
+        """LLM 기반 비평 분석: 실행 결과 분석 및 완료 여부 판단"""
         
         # 외부 Prompt Component 사용
         critic_prompt = create_prompt_from_component(
             self.critic_prompt,
-            default_system_message="당신은 작업 실행 결과를 분석하고 개선안을 제시하는 전문 비평가입니다."
+            default_system_message="당신은 작업 실행 결과를 분석하고 완료 여부를 판단하는 전문 비평가입니다."
         )
         
         if critic_prompt is None:
@@ -1601,146 +1915,44 @@ class A2AAgentComponent(ToolCallingAgentComponent):
             completed_tasks = sum(1 for result in execution_results.values() if result.get("status") == "completed")
             failed_tasks = sum(1 for result in execution_results.values() if result.get("status") == "failed")
             
-            # 현재 진행 상황 컨텍스트 추가
-            all_task_ids = [task["id"] for task in current_plan.get("work_breakdown", [])]
-            completed_task_ids = [task_id for task_id, result in execution_results.items() if result.get("status") == "completed"]
-            pending_task_ids = [task_id for task_id in all_task_ids if task_id not in execution_results]
+            # JSON 직렬화 안전 처리
+            def safe_json_dumps(obj):
+                try:
+                    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+                except Exception as e:
+                    logger.warning(f"JSON 직렬화 실패, 문자열 변환 사용: {e}")
+                    return str(obj)
             
-            task_summary = {
-                "total": total_tasks,
-                "completed": completed_tasks,
-                "failed": failed_tasks,
-                "completion_rate": f"{completed_tasks}/{total_tasks}",
-                "execution_context": {
-                    "mode": "순차 실행 (PDC 사이클)",
-                    "current_status": f"현재까지 {completed_tasks}개 작업 완료, {len(pending_task_ids)}개 작업 대기 중",
-                    "completed_tasks": completed_task_ids,
-                    "pending_tasks": pending_task_ids,
-                    "note": "작업은 한 번에 하나씩 순차적으로 처리되며, 각 작업 완료 후 결과를 분석합니다."
-                }
-            }
-            
-            # 실행 결과 요약 - 큰 응답 데이터 처리
-            logger.info(f"Processing {len(execution_results)} execution results for critic analysis")
-            summarized_results = {}
-            for task_id, result in execution_results.items():
-                logger.info(f"Processing result for task {task_id}: keys={list(result.keys())}")
-                
-                # execution_results의 중첩 구조 처리
-                # result = {'status': 'completed', 'result': {...actual_data...}, 'agent': '...'}
-                actual_result = result.get("result", result)  # 중첩된 result 구조 해결
-                
-                summary = {
-                    "task_id": actual_result.get("task_id", task_id),
-                    "agent_id": actual_result.get("agent_id", result.get("agent", "unknown")),
-                    "status": actual_result.get("status", result.get("status", "unknown")),
-                    "timestamp": actual_result.get("timestamp", "unknown")
-                }
-                
-                # result 데이터 처리 (A2A 에이전트 응답 또는 직접 계산 결과)
-                has_agent_response = "agent_response" in actual_result
-                has_result_in_response = has_agent_response and actual_result["agent_response"] and "result" in actual_result["agent_response"]
-                has_direct_result = "result" in actual_result and "execution_method" in actual_result
-                
-                logger.info(f"Task {task_id} - has_agent_response: {has_agent_response}, has_result_in_response: {has_result_in_response}")
-                logger.info(f"Task {task_id} - has_direct_result: {has_direct_result}")
-                
-                if has_result_in_response:
-                    # A2A 에이전트 응답 처리
-                    agent_result = actual_result["agent_response"]["result"]
-                    result_str = str(agent_result)
-                    summary["result_preview"] = result_str[:200] + "..." if len(result_str) > 200 else result_str
-                    summary["result_size"] = len(result_str)
-                    logger.info(f"Task {task_id} - result_size: {len(result_str)}")
-                elif has_direct_result:
-                    # 직접 실행 결과 처리 (수학 계산 등)
-                    direct_result = actual_result["result"]
-                    result_str = str(direct_result)
-                    summary["result_preview"] = result_str[:200] + "..." if len(result_str) > 200 else result_str
-                    summary["result_size"] = len(result_str)
-                    summary["execution_method"] = actual_result.get("execution_method", "direct")
-                    logger.info(f"Task {task_id} - direct result_size: {len(result_str)}")
-                else:
-                    summary["result_preview"] = "No result data"
-                    logger.warning(f"Task {task_id} - No result data found")
-                
-                if "error" in result:
-                    summary["error"] = result["error"]
-                    
-                summarized_results[task_id] = summary
-            
-            # LLM이 있는지 확인하고 없으면 휴리스틱 기반 비평 사용
-            if not hasattr(self, 'llm') or self.llm is None:
-                logger.warning("LLM not available for critic phase, using heuristic critic")
-                return await self._heuristic_based_critic(execution_results, current_plan)
-
             chain = critic_prompt | self.llm | JsonOutputParser()
             result = await chain.ainvoke({
-                "execution_results": json.dumps(summarized_results, ensure_ascii=False, indent=2),
-                "current_plan": json.dumps(current_plan, ensure_ascii=False, indent=2),
-                "task_summary": json.dumps(task_summary, ensure_ascii=False, indent=2)
+                "execution_results": safe_json_dumps(execution_results),
+                "current_plan": safe_json_dumps(current_plan)
             })
-            
+            #logger.info(f"--------------------------------")
+            #logger.info(f"task id: {task_id}")
+            ## work_breakdown에서 id가 task_id와 같은 요소를 찾음
+            #task_info = next((task for task in current_plan.get('work_breakdown', []) if task.get('id') == task_id), None)
+            #logger.info(f"task: {task_info}")
+            #logger.info(f"--------------------------------")
+            #logger.info(f"critic_result: {result}")
+            #logger.info(f"--------------------------------") 
+
             # 기본값 보장
             if "is_complete" not in result:
                 result["is_complete"] = (completed_tasks == total_tasks) and (failed_tasks == 0)
-            if "updated_plan" not in result:
-                result["updated_plan"] = current_plan
-            if "next_actions" not in result:
-                result["next_actions"] = ["계속 진행"]
+            if "analysis" not in result:
+                result["analysis"] = f"완료된 작업: {completed_tasks}/{total_tasks}, 실패한 작업: {failed_tasks}"
+            if "recommendations" not in result:
+                result["recommendations"] = ["계속 진행"]
                 
             logger.info("LLM-based critic analysis completed")
             return result
             
         except Exception as e:
-            logger.error(f"LLM critic analysis failed: {e}, falling back to heuristic")
-            return await self._heuristic_based_critic(execution_results, current_plan)
+            msg=f"LLM critic analysis failed: {e}"
+            logger.error(msg)
+            raise ValueError(msg)   
     
-    async def _heuristic_based_critic(self, execution_results: Dict[str, Any], current_plan: Dict[str, Any]) -> Dict[str, Any]:
-        """휴리스틱 기반 비평 분석 (기존 로직)"""
-        
-        # 실행 결과 분석
-        total_tasks = len(current_plan.get("work_breakdown", []))
-        completed_tasks = 0
-        failed_tasks = 0
-        
-        for task_id, result in execution_results.items():
-            if result.get("status") == "completed":
-                completed_tasks += 1
-            elif result.get("status") == "failed":
-                failed_tasks += 1
-        
-        logger.info(f"Task analysis: {completed_tasks}/{total_tasks} completed, {failed_tasks} failed")
-        
-        # 완료 조건 판단
-        is_complete = (completed_tasks == total_tasks) and (failed_tasks == 0)
-        
-        # 간단한 비평 생성
-        if is_complete:
-            critique = f"모든 작업이 성공적으로 완료되었습니다. ({completed_tasks}/{total_tasks} 완료)"
-            next_actions = ["작업 완료"]
-        elif failed_tasks > 0:
-            critique = f"일부 작업이 실패했습니다. ({failed_tasks}개 실패, {completed_tasks}개 완료)"
-            next_actions = ["실패한 작업 재시도", "오류 원인 분석"]
-        else:
-            critique = f"작업이 진행 중입니다. ({completed_tasks}/{total_tasks} 완료)"
-            next_actions = ["남은 작업 계속 진행"]
-        
-        result = {
-            "critique": critique,
-            "updated_plan": current_plan,  # 현재 계획 유지
-            "is_complete": is_complete,
-            "next_actions": next_actions,
-            "task_summary": {
-                "total": total_tasks,
-                "completed": completed_tasks,
-                "failed": failed_tasks
-            }
-        }
-        
-        logger.info(f"Heuristic critic phase result: {result}")
-        return result
-
     async def get_memory_data(self):
         # TODO: This is a temporary fix to avoid message duplication. We should develop a function for this.
         messages = (
@@ -1778,8 +1990,22 @@ class A2AAgentComponent(ToolCallingAgentComponent):
         model_kwargs = {}
         for input_ in inputs:
             if hasattr(self, f"{prefix}{input_.name}"):
-                model_kwargs[input_.name] = getattr(self, f"{prefix}{input_.name}")
-        return component.set(**model_kwargs).build_model()
+                value = getattr(self, f"{prefix}{input_.name}")
+                if value is not None:  # None 값 제외
+                    model_kwargs[input_.name] = value
+        
+        try:
+            if model_kwargs:
+                return component.set(**model_kwargs).build_model()
+            else:
+                return component.build_model()
+        except Exception as e:
+            logger.warning(f"Component.set() 실패, 기본 설정으로 시도: {e}")
+            try:
+                return component.build_model()
+            except Exception as e2:
+                logger.error(f"Component.build_model()도 실패: {e2}")
+                raise
 
     def set_component_params(self, component):
         provider_info = MODEL_PROVIDERS_DICT.get(self.agent_llm)
@@ -1931,3 +2157,4 @@ class A2AAgentComponent(ToolCallingAgentComponent):
 
 
 
+ㄴㅁ
