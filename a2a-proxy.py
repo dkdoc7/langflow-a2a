@@ -295,17 +295,6 @@ def _normalize_input_type(raw: Optional[str]) -> str:
     return "any"
 
 
-async def _raise_for_upstream(resp: httpx.Response) -> None:
-    """Convert Langflow 4xx/5xx to FastAPI HTTPException (bytes-safe)."""
-    if resp.status_code < 400:
-        return
-    content = await resp.aread()
-    try:
-        detail = json.loads(content)
-    except Exception:
-        detail = content.decode("utf-8", errors="replace")
-    raise HTTPException(status_code=resp.status_code, detail=detail)
-
 
 # ---------------------------------------------------------------------------
 # 🚀 FastAPI proxy app factory
