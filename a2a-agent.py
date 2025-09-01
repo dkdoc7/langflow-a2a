@@ -321,6 +321,94 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                 sender_name=MESSAGE_SENDER_NAME_AI
             )
 
+
+
+    def _extract_text_from_agent_response(self, agent_response: Dict[str, Any]) -> str:
+        """A2A 에이전트 응답에서 실제 텍스트를 추출하는 헬퍼 함수"""
+        try:
+            # 1. 표준 A2A 응답 구조 확인
+            if isinstance(agent_response, dict) and "result" in agent_response:
+                response_content = agent_response["result"]
+                if isinstance(response_content, dict) and "parts" in response_content:
+                    for part in response_content["parts"]:
+                        if part.get("kind") == "text":
+                            return part.get("text", "")
+            
+            # 2. Langflow 응답 구조 확인 (outputs -> results -> message -> text)
+            if isinstance(agent_response, dict) and "outputs" in agent_response:
+                outputs = agent_response["outputs"]
+                if isinstance(outputs, list) and outputs:
+                    first_output = outputs[0]
+                    if isinstance(first_output, dict) and "results" in first_output:
+                        results = first_output["results"]
+                        if isinstance(results, dict) and "message" in results:
+                            message = results["message"]
+                            if isinstance(message, dict) and "text" in message:
+                                return message["text"]
+            
+            # 3. 중첩된 outputs 구조 확인
+            if isinstance(agent_response, dict):
+                # 재귀적으로 텍스트 찾기
+                def find_text_recursive(obj, max_depth=5):
+                    if max_depth <= 0:
+                        return None
+                    
+                    if isinstance(obj, dict):
+                        # text 키가 있으면 반환
+                        if "text" in obj and isinstance(obj["text"], str):
+                            return obj["text"]
+                        # 재귀적으로 검색
+                        for value in obj.values():
+                            result = find_text_recursive(value, max_depth - 1)
+                            if result:
+                                return result
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            result = find_text_recursive(item, max_depth - 1)
+                            if result:
+                                return result
+                    return None
+                
+                found_text = find_text_recursive(agent_response)
+                if found_text:
+                    return found_text
+            
+            # 4. JSON 문자열로 변환해서 텍스트 찾기
+            import json
+            json_str = json.dumps(agent_response, ensure_ascii=False)
+            # 간단한 텍스트 패턴 찾기
+            import re
+            text_patterns = [
+                r'"text":\s*"([^"]+)"',
+                r'"message":\s*"([^"]+)"',
+                r'"content":\s*"([^"]+)"'
+            ]
+            
+            for pattern in text_patterns:
+                matches = re.findall(pattern, json_str)
+                if matches:
+                    # 가장 긴 텍스트 반환
+                    return max(matches, key=len)
+            
+            return ""
+            
+        except Exception as e:
+            logger.error(f"Error extracting text from agent response: {e}")
+            return ""
+
+    def _extract_user_text_from_task(self, user_task: str) -> str:
+        """사용자 요청에서 실제 텍스트만 추출하는 헬퍼 함수"""
+        try:
+            import json
+            # JSON 형태인지 확인
+            if user_task.strip().startswith('{'):
+                task_data = json.loads(user_task)
+                if isinstance(task_data, dict) and "text" in task_data:
+                    return task_data["text"]
+            return user_task
+        except Exception:
+            return user_task
+
     def get_default_work_plan(self, user_task: str, available_agents: List[Dict[str, Any]]) -> Dict[str, Any]:
         """LLM이 없을 때 사용할 기본 작업 계획 생성"""
         logger.info("Generating default work plan")
@@ -411,92 +499,6 @@ class A2AAgentComponent(ToolCallingAgentComponent):
         else:
             return "일반 작업 처리"
 
-    def _extract_text_from_agent_response(self, agent_response: Dict[str, Any]) -> str:
-        """A2A 에이전트 응답에서 실제 텍스트를 추출하는 헬퍼 함수"""
-        try:
-            # 1. 표준 A2A 응답 구조 확인
-            if isinstance(agent_response, dict) and "result" in agent_response:
-                response_content = agent_response["result"]
-                if isinstance(response_content, dict) and "parts" in response_content:
-                    for part in response_content["parts"]:
-                        if part.get("kind") == "text":
-                            return part.get("text", "")
-            
-            # 2. Langflow 응답 구조 확인 (outputs -> results -> message -> text)
-            if isinstance(agent_response, dict) and "outputs" in agent_response:
-                outputs = agent_response["outputs"]
-                if isinstance(outputs, list) and outputs:
-                    first_output = outputs[0]
-                    if isinstance(first_output, dict) and "results" in first_output:
-                        results = first_output["results"]
-                        if isinstance(results, dict) and "message" in results:
-                            message = results["message"]
-                            if isinstance(message, dict) and "text" in message:
-                                return message["text"]
-            
-            # 3. 중첩된 outputs 구조 확인
-            if isinstance(agent_response, dict):
-                # 재귀적으로 텍스트 찾기
-                def find_text_recursive(obj, max_depth=5):
-                    if max_depth <= 0:
-                        return None
-                    
-                    if isinstance(obj, dict):
-                        # text 키가 있으면 반환
-                        if "text" in obj and isinstance(obj["text"], str):
-                            return obj["text"]
-                        # 재귀적으로 검색
-                        for value in obj.values():
-                            result = find_text_recursive(value, max_depth - 1)
-                            if result:
-                                return result
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            result = find_text_recursive(item, max_depth - 1)
-                            if result:
-                                return result
-                    return None
-                
-                found_text = find_text_recursive(agent_response)
-                if found_text:
-                    return found_text
-            
-            # 4. JSON 문자열로 변환해서 텍스트 찾기
-            import json
-            json_str = json.dumps(agent_response, ensure_ascii=False)
-            # 간단한 텍스트 패턴 찾기
-            import re
-            text_patterns = [
-                r'"text":\s*"([^"]+)"',
-                r'"message":\s*"([^"]+)"',
-                r'"content":\s*"([^"]+)"'
-            ]
-            
-            for pattern in text_patterns:
-                matches = re.findall(pattern, json_str)
-                if matches:
-                    # 가장 긴 텍스트 반환
-                    return max(matches, key=len)
-            
-            return ""
-            
-        except Exception as e:
-            logger.error(f"Error extracting text from agent response: {e}")
-            return ""
-
-    def _extract_user_text_from_task(self, user_task: str) -> str:
-        """사용자 요청에서 실제 텍스트만 추출하는 헬퍼 함수"""
-        try:
-            import json
-            # JSON 형태인지 확인
-            if user_task.strip().startswith('{'):
-                task_data = json.loads(user_task)
-                if isinstance(task_data, dict) and "text" in task_data:
-                    return task_data["text"]
-            return user_task
-        except Exception:
-            return user_task
-
     def _log_work_breakdown(self, work_plan: Dict[str, Any]) -> None:
         """작업 계획의 작업 목록을 로그로 출력하는 헬퍼 함수"""
         if "work_breakdown" in work_plan:
@@ -507,6 +509,8 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                 outputs = task.get("outputs", [])
                 dod = task.get("dod", [])
                 logger.info(f"  {i}. {title}\r\n     출력: {', '.join(outputs)}\r\n     완료 기준: {', '.join(dod)}")
+
+
 
     def format_final_result(self, work_plan: Dict[str, Any], final_result: Dict[str, Any]) -> str:
         """최종 결과를 사용자 친화적인 형태로 포맷팅"""
@@ -698,7 +702,7 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                             logger.warning(f"A2A Discovery : Unexpected response format from A2A Discovery service: {type(response_data)}")
                             return []
                     else:
-                        logger.warning(f"FA2A Discovery : ailed to get agents from A2A Discovery service: {response.status}")
+                        logger.warning(f"A2A Discovery : Failed to get agents from A2A Discovery service: {response.status}")
                         return []
         except Exception as e:
             logger.warning(f"A2A Discovery : Error connecting to A2A Discovery service: {e}")
@@ -2154,7 +2158,3 @@ class A2AAgentComponent(ToolCallingAgentComponent):
                         component_class, build_config, field_value, "model_name"
                     )
         return dotdict({k: v.to_dict() if hasattr(v, "to_dict") else v for k, v in build_config.items()})
-
-
-
-ㄴㅁ
