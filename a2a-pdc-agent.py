@@ -100,9 +100,7 @@ def create_prompt_from_component(prompt_component, default_system_message: str =
         if not template_content or not template_content.strip():
             logger.warning("Template content is empty")
             return None
-            
-        logger.info(f"Template content extracted: {template_content[:100]}...")
-        
+                    
         if "{chat_history}" in str(template_content):
             msgs = []
             if default_system_message:
@@ -116,6 +114,26 @@ def create_prompt_from_component(prompt_component, default_system_message: str =
     except Exception as e:
         logger.error(f"Error creating prompt from component: {e}")
         return None
+
+
+def decode_unicode_escapes(text: str) -> str:
+    """주어진 문자열에 \\uXXXX 형태의 유니코드 이스케이프가 포함되면 사람이 읽을 수 있는 문자로 변환한다."""
+    if not isinstance(text, str):
+        return text
+    # JSON 문자열 리터럴 형태("\uc548...\u...")인 경우 파싱 시도
+    try:
+        loaded = json.loads(text)
+        if isinstance(loaded, str):
+            return loaded
+    except Exception:
+        pass
+    # 일반 문자열에서 유니코드 이스케이프 디코딩 시도
+    if "\\u" in text:
+        try:
+            return text.encode("utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+    return text
 
 def find_filed(obj, key):
     if isinstance(obj, dict):
@@ -289,27 +307,18 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
                     critique = {"is_complete": True}
                     break
                 
-                result_data={}
-                if new_results[task_id].get('execution_method') == "self" :
-                    logger.info(f"-- PDC 11112222: New results: {new_results} \n-----")
-                    result_data = find_filed(new_results, 'result')
-                else:
-                    result_parts = find_filed(new_results, 'parts')
-                    result_data = find_filed(result_parts[0], 'text')
-                    result_json = json.loads(result_data)
-                    result_data = find_filed(result_json, 'data')
-                    result_data = find_filed(result_data, 'text')
+                result_data=new_results.get(task_id).get('result')
 
                 new_result = {
                     task_id: {
                         "status": new_results.get(task_id).get("status"), 
-                        "outputs": task_outputs,
-                        #"session_id": session_id,
-                        "result": result_data
+                        "outputs": result_data,
                     }
                 }
                 # 결과 합치기
                 existing_results[task_id] = new_result
+                self._last_execution = existing_results
+                self.execution_output()
 
                 # 비평 단계
                 critique = await self.critic_phase(task_id, existing_results, plan)
@@ -317,12 +326,7 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
                 self._last_critique = critique_results
                 self.critique_output()
 
-
-                existing_results[task_id]["outputs"] = find_filed(critique, 'output_values')
-                self._last_execution = existing_results
-                self.execution_output()
-
-                logger.info(f"-- PDC : Critic phase has been completed\n{existing_results}")
+                logger.info(f"-- PDC : Critic phase has been completed.")
 
                 # 조건부 계획 업데이트
                 if decide_plan_update(critique, plan):
@@ -383,6 +387,7 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             raise ValueError("입력값이 제공되지 않았습니다. Input Value를 연결해주세요.")
         
         user_task = self.input_value.content if hasattr(self.input_value, "content") else str(self.input_value)
+        user_task = decode_unicode_escapes(user_task)
         if not user_task or not user_task.strip():
             raise ValueError("입력값이 비어있습니다. 유효한 작업 내용을 입력해주세요.")
         
@@ -504,6 +509,7 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             output_schema = self._parse_json_string_relaxed(raw)
 
         user_task = self.input_value.content if hasattr(self.input_value, "content") else str(self.input_value)
+        user_task = decode_unicode_escapes(user_task)
         chain = planning_prompt | self.llm | JsonOutputParser()
 
         logger.info(f"-- PDC : Planning Started...")
@@ -534,10 +540,13 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
                 if agent_id and agent_id != "self":
                     logger.info(f"-- PDC : Delegating task to agent {agent_id}")
                     res = await self.delegate_task_to_agent(task, agent_id, available_agents)
+                    #res->result->parts[0]를 추출. 실패일 경우 기본 응답 생성
+                    res = res.get("result", {}).get("parts", [{}])[0].get("text", "")
                     new_results[task_id] = {"status": "completed","execution_method": "agent", "result": res, "agent": agent_id}
                 else:
                     logger.info(f"-- PDC : Executing task directly")
                     res = await self.execute_task_directly(task, existing_results)
+                    res = res.get("result", {})
                     new_results[task_id] = {"status": "completed","execution_method": "self", "result": res, "agent": agent_id}
             except Exception as e:
                 new_results[task_id] = {"status": "failed", "error": str(e), "agent": agent_id}
@@ -584,22 +593,31 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
 
             if not critic_text or not str(critic_text).strip():
                 raise ValueError("Critic Prompt 변환에 실패했습니다. 올바른 프롬프트 템플릿을 연결해주세요.")
-
             prompt = ChatPromptTemplate.from_messages([
                 ("system", "{system_prompt}\n\n{critic_prompt}\n\nReturn a SINGLE JSON object that strictly matches the given output_schema. No markdown fences or extra text."),
                 ("human", "Execution Results to Evaluate:\n{execution_results}\n\nCurrent Plan:\n{current_plan}\n\nOutput Schema:\n{output_schema}")
             ])
 
             chain = prompt | self.llm | JsonOutputParser()
+            #current_plan에서 execution_plan을 제외하고 추출 (이후 critic 작업에 영향을 미치는 요소들 제거. 중요함!)
+            _cp = current_plan
+            cp = {
+                "goal": _cp.get("goal", ""),
+                "assumptions": _cp.get("assumptions", []),
+                "critical_path": _cp.get("critical_path", []),
+                "risk_global": _cp.get("risk_global", []),
+                "work_breakdown": _cp.get("work_breakdown", []),
+                }
+
             result = await chain.ainvoke({
                 "system_prompt": system_prompt_text,
                 "critic_prompt": critic_text,
                 "execution_results": safe(execution_results),
-                "current_plan": safe(current_plan),
+                "current_plan": safe(cp),
                 "output_schema": json.dumps(output_schema, ensure_ascii=False, indent=2),
             })
         except Exception as e:
-            logger.warning(f"JSON 파싱 실패, 기본 응답으로 대체: {e}")
+            logger.error(f"JSON 파싱 실패, 기본 응답으로 대체: {e}")
             # JSON 파싱 실패 시 기본 응답 생성
             result = {
                 "is_complete": False,
@@ -628,7 +646,6 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
                 prompt = f"""다음 작업을 수행해주세요:\n\n작업: {task_description}\n입력: {task_inputs}\n\n이전작업 결과: {existing_results}\n\n결과를 간결히 반환하세요."""
                 response = await self.llm.ainvoke([HumanMessage(content=prompt)])
                 content = response.content if hasattr(response, "content") else str(response)
-                logger.info(f"-- PDC 5557775: Executing task directly {content}")
                 return {"task_id": task.get("id"), "execution_method": "llm_general", "status": "completed", "result": content}
                 
             except Exception:
@@ -674,7 +691,7 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             async with session.post(agent_url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return {"agent_response": data}
+                    return data
                 raise ValueError(f"Agent returned status {resp.status}")
 
 

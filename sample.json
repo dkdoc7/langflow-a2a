@@ -1,113 +1,26 @@
-{
-    "goal": "주어진 문장의 단어 수와 토큰 수를 분석하고, 그 곱의 자연로그를 계산하여 결과를 제공한다.",
-    "assumptions": [
-        "사용자가 제공한 문장은 '안녕하세요? 반갑습니다!'이다.",
-        "text-analyzer 에이전트는 단어 수와 토큰 수를 동시에 분석할 수 있다."
-    ],
-    "updated": true,
-    "work_breakdown": [
-        {
-            "id": "T1",
-            "title": "텍스트 분석 (단어 수, 토큰 수 추출)",
-            "description": "주어진 문장에서 단어 수와 토큰 수를 추출한다.",
-            "agent": {
-                "name": "text-analyzer",
-                "url": "http://0.0.0.0:5005/"
-            },
-            "skills": [
-                "텍스트 분석",
-                "자연어 처리"
-            ],
-            "inputs": [
-                "안녕하세요? 반갑습니다!"
-            ],
-            "outputs": [
-                "단어 수",
-                "토큰 수"
-            ],
-            "dod": [
-                "단어 수와 토큰 수가 정확히 추출되었다."
-            ],
-            "est_hours": 0.1,
-            "dependencies": [],
-            "parallelizable": false,
-            "risk": [
-                "에이전트의 응답 지연",
-                "잘못된 분석 결과"
-            ],
-            "mitigation": [
-                "에이전트의 상태를 모니터링하고, 필요시 재요청",
-                "결과 검증 절차 마련"
-            ],
-            "bus": {
-                "use_bus": false
-            }
-        },
-        {
-            "id": "T2",
-            "title": "수학 계산 (곱셈 + 자연로그)",
-            "description": "T1에서 추출한 단어 수와 토큰 수를 곱한 후 자연로그를 계산한다.",
-            "agent": {
-                "name": "self",
-                "url": ""
-            },
-            "skills": [
-                "수학 계산"
-            ],
-            "inputs": [
-                "단어 수",
-                "토큰 수"
-            ],
-            "outputs": [
-                "자연로그 결과"
-            ],
-            "dod": [
-                "자연로그 결과가 정확히 계산되었다."
-            ],
-            "est_hours": 0.1,
-            "dependencies": [
-                "T1"
-            ],
-            "parallelizable": false,
-            "risk": [
-                "잘못된 수학적 계산"
-            ],
-            "mitigation": [
-                "계산 과정 검증"
-            ],
-            "bus": {
-                "use_bus": false
-            }
-        }
-    ],
-    "critical_path": [
-        "T1",
-        "T2"
-    ],
-    "execution_plan": [
-        {
-            "phase": "텍스트 분석",
-            "targets": [
-                "T1"
-            ],
-            "notes": "단어 수와 토큰 수를 추출한다."
-        },
-        {
-            "phase": "수학 계산",
-            "targets": [
-                "T2"
-            ],
-            "notes": "T1의 결과를 바탕으로 자연로그를 계산한다."
-        }
-    ],
-    "risks_global": [
-        "에이전트의 응답 지연",
-        "잘못된 분석 결과",
-        "잘못된 수학적 계산"
-    ],
-    "mitigations_global": [
-        "에이전트의 상태를 모니터링하고, 필요시 재요청",
-        "결과 검증 절차 마련",
-        "계산 과정 검증"
-    ]
+{'T1': {'T1': {'status':                   
+                             'completed', 'outputs': ['단어             
+                             수', '토큰 수'
+            ], 'result':                 
+                             "{'단어 수': '4', '토큰 수':               
+                             '8'
+        }"}, 'outputs': [{'단어                 
+                             수': '4', '토큰 수': '8'
+    }
+]
+},               
+                             'T2': {'T2': {'status':                    
+                             'completed', 'outputs': ['결과             
+                             값'
+    ], 'result': '결과: 512'
+},              
+                             'outputs': [
+    {'단어 수': '4',               
+                             '토큰 수': '8'
+    },
+    {'결과 값':               
+                             '결과: 512'
+    }
+]
+}
 }
