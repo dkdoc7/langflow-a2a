@@ -1,4 +1,7 @@
 from langchain_core.tools import StructuredTool
+from typing import Dict
+from urllib.parse import quote_plus
+import aiohttp
 
 from langflow.base.agents.agent import LCToolsAgentComponent
 from langflow.base.agents.events import ExceptionWithMessageError
@@ -80,7 +83,11 @@ class AgentComponent(ToolCallingAgentComponent):
     ]
     outputs = [Output(name="response", display_name="Response", method="message_response")]
 
+
+
     async def message_response(self) -> Message:
+
+        await self.chat("a12345", "text-analyzer", "네! 작업을 시작하겠습니다.")
         try:
             # Get LLM model and validate
             llm_model, display_name = self.get_llm()
@@ -114,8 +121,12 @@ class AgentComponent(ToolCallingAgentComponent):
                 system_prompt=self.system_prompt,
             )
             agent = self.create_agent_runnable()
-            return await self.run_agent(agent)
-
+            result = await self.run_agent(agent)
+            logger.info(f"result: {result}")
+            #str = self.decode_unicode_escapes(result.get("text", ""))
+            await self.chat(self._session_id, self._sender, "결과는 다음과 같습니다")
+            await self.chat(self._session_id, self._sender, f"{result}")
+            return result
         except (ValueError, TypeError, KeyError) as e:
             logger.error(f"{type(e).__name__}: {e!s}")
             raise
@@ -175,6 +186,51 @@ class AgentComponent(ToolCallingAgentComponent):
 
             return component.set(**model_kwargs)
         return component
+
+    def decode_unicode_escapes(text: str) -> str:
+        """주어진 문자열에 \\uXXXX 형태의 유니코드 이스케이프가 포함되면 사람이 읽을 수 있는 문자로 변환한다."""
+        if not isinstance(text, str):
+            return text
+        # JSON 문자열 리터럴 형태("\uc548...\u...")인 경우 파싱 시도
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, str):
+                return loaded
+        except Exception:
+            pass
+        # 일반 문자열에서 유니코드 이스케이프 디코딩 시도
+        if "\\u" in text:
+            try:
+                return text.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+        return text
+        
+    async def chat(self, session_id: str, sender: str, msg: str) -> Dict[str, any]:
+        """
+        A2A Discovery chat API 호출.
+        Endpoint: POST http://localhost:8000/chat/{session_id}/{sender}?msg={message}
+        """
+        # 인스턴스에 유지(선택적)
+        self._session_id = session_id
+        self._sender = sender
+
+        message_q = quote_plus(msg or "")
+        base_url = "http://localhost:8000"
+        url = f"{base_url}/chat/{session_id}/{sender}?msg={message_q}"
+
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {"status": resp.status, "text": await resp.text()}
+                if resp.status >= 400:
+                    raise ValueError(f"chat API error {resp.status}: {data}")
+                return data
+
+    
 
     def delete_fields(self, build_config: dotdict, fields: dict | list[str]) -> None:
         """Delete specified fields from build_config."""

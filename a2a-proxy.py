@@ -9,7 +9,7 @@ import re
 import socket
 import threading
 import time
-from typing import Any, AsyncIterator, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from uuid import uuid4
 
 import httpx
@@ -22,7 +22,7 @@ from langflow.custom.custom_component.component import Component
 from langflow.inputs import BoolInput, IntInput, MessageTextInput, SecretStrInput
 from langflow.io import HandleInput, Output
 
-import asyncio, logging
+import logging
 log = logging.getLogger("a2a-proxy")
 
 # ---------------------------------------------------------------------------
@@ -284,18 +284,6 @@ def _sse_event(data: Any, event: Optional[str] = None, id_: Optional[str] = None
     return ("\n".join(lines) + "\n").encode()
 
 
-def _normalize_input_type(raw: Optional[str]) -> str:
-    if not raw:
-        return "any"
-    raw = raw.lower()
-    if raw in {"chat", "text", "any"}:
-        return raw
-    if raw.startswith("text/"):
-        return "text"
-    return "any"
-
-
-
 # ---------------------------------------------------------------------------
 # 🚀 FastAPI proxy app factory
 # ---------------------------------------------------------------------------
@@ -318,6 +306,27 @@ def _sse_proxy_app(
         docs_url=None,
         redoc_url=None,
     )
+
+    # ------------ Flow resolution (once at startup) ------------
+    # flow_id_cfg가 있으면 그것을 사용, 없으면 해결
+    if flow_id_cfg:
+        resolved_flow_id = flow_id_cfg
+        resolved_flow_name = flow_name_cfg or ""
+    else:
+        # 캐시에서 먼저 확인
+        cache_key = _key_of(lf_url, api_key)
+        if cache_key in resolved_flow_cache:
+            resolved_flow_id, resolved_flow_name = resolved_flow_cache[cache_key]
+        else:
+            # 해결하고 캐시에 저장
+            resolved_flow_id, resolved_flow_name = _resolve_flow_id_sync(
+                lf_url,
+                api_key,
+                flow_id_cfg,
+                flow_name_cfg,
+                allow_singleton_pick=auto_pick_singleton,
+            )
+            resolved_flow_cache[cache_key] = (resolved_flow_id, resolved_flow_name or "")
 
     # ------------ Request models ------------
 
@@ -345,84 +354,38 @@ def _sse_proxy_app(
             "cache-control": "no-cache",
         }
 
-    async def _resolve_for_request(req_session_id: Optional[str]) -> Tuple[str, str]:
-        """Resolve flow for each request (cache aware)."""
-        if flow_id_cfg:
-            return flow_id_cfg, flow_name_cfg or ""
-        if prefer_session_as_flow and req_session_id:
-            return req_session_id, "(session-as-flow)"
-        cache_key = _key_of(lf_url, api_key)
-        if cache_key in resolved_flow_cache:
-            return resolved_flow_cache[cache_key]
-        rid, rname = _resolve_flow_id_sync(
-            lf_url,
-            api_key,
-            flow_id_cfg,
-            flow_name_cfg,
-            allow_singleton_pick=auto_pick_singleton,
-        )
-        resolved_flow_cache[cache_key] = (rid, rname or "")
-        return rid, rname or ""
 
     def _message_to_text(msg: dict) -> str:
         """
-        A2A Message → text 추출(방어적).
-        1) parts[*].text  또는  parts[*].root.text
-        2) (실수 대비) arts[*].text  또는  arts[*].root.text
-        3) 톱레벨 msg["text"] / msg["content"] / msg["value"]
-        4) msg 자체가 str이면 그대로
+        A2A Message → text 추출 (단순화).
+        parts[0].text를 우선 사용, 실패 시 기본 폴백
         """
         if not msg:
             return ""
         if isinstance(msg, str):
             return msg.strip()
 
-        texts: list[str] = []
-
-        def collect_from_list(arr):
-            for p in arr:
-                if isinstance(p, dict):
-                    # 표준
-                    if p.get("kind") == "text" and isinstance(p.get("text"), str):
-                        t = p["text"].strip()
-                        if t:
-                            texts.append(t)
-                    else:
-                        root = p.get("root")
-                        if isinstance(root, dict) and isinstance(root.get("text"), str):
-                            t = root["text"].strip()
-                            if t:
-                                texts.append(t)
-
+        # parts[0].text 우선 시도
         parts = msg.get("parts")
-        if isinstance(parts, list):
-            collect_from_list(parts)
+        if isinstance(parts, list) and parts:
+            first_part = parts[0]
+            if isinstance(first_part, dict):
+                text = first_part.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
 
-        # 흔한 오타/변형
-        arts = msg.get("arts")
-        if isinstance(arts, list):
-            collect_from_list(arts)
-
+        # 기본 폴백
         for k in ("text", "content", "value"):
             v = msg.get(k)
             if isinstance(v, str) and v.strip():
-                texts.append(v.strip())
+                return v.strip()
 
-        return "\n".join(texts).strip()
+        return ""
 
 
     def _rpc_envelope(rpc_id: str, result: dict) -> dict:
         return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
 
-    def _a2a_status_text(text: str) -> dict:
-        return {
-            "kind": "status-update",
-            "message": {
-                "message_id": str(uuid4()),
-                "role": "agent",
-                "parts": [{"kind": "text", "text": text}],
-            },
-        }
 
     def _a2a_message_text(text: str) -> dict:
         return {
@@ -431,6 +394,39 @@ def _sse_proxy_app(
             "role": "agent",
             "parts": [{"kind": "text", "text": text}],
         }
+
+    def _extract_text_from_langflow_json(obj: Any) -> Optional[str]:
+        """
+        Langflow 응답 JSON에서 텍스트를 우선 경로로 추출.
+        우선순위:
+        1) outputs[0].outputs[0].results.message.data.text
+        2) outputs[0].outputs[0].results.message.text
+        찾지 못하면 None
+        """
+        try:
+            outputs = obj.get("outputs")
+            if isinstance(outputs, list) and outputs:
+                outer0 = outputs[0]
+                if isinstance(outer0, dict):
+                    inner_outputs = outer0.get("outputs")
+                    if isinstance(inner_outputs, list) and inner_outputs:
+                        inner0 = inner_outputs[0]
+                        if isinstance(inner0, dict):
+                            results = inner0.get("results")
+                            if isinstance(results, dict):
+                                message = results.get("message")
+                                if isinstance(message, dict):
+                                    data = message.get("data")
+                                    if isinstance(data, dict):
+                                        t = data.get("text")
+                                        if isinstance(t, str) and t:
+                                            return t
+                                    t2 = message.get("text")
+                                    if isinstance(t2, str) and t2:
+                                        return t2
+        except Exception:
+            pass
+        return None
 
     def _url_for_flow(flow_id: str, want_stream: bool) -> str:
         path = stream_path.format(flow_id=flow_id)
@@ -441,94 +437,6 @@ def _sse_proxy_app(
             path = f"{path}{sep}stream={'true' if want_stream else 'false'}"
         return f"{lf_url.rstrip('/')}{path}"
 
-    # 교체: 업스트림 SSE → (1) chunk별 delta 이벤트(JSON-RPC 랩핑) (2) 종료 시 full 텍스트 1회 추가 송출
-    async def _jsonrpc_stream_bridge(upstream: httpx.Response, rpc_id: str) -> AsyncIterator[bytes]:
-        final_buf: list[str] = []
-
-        try:
-            async for chunk in upstream.aiter_raw():
-                if not chunk:
-                    continue
-
-                # 1) 디코드 및 CRLF 정규화
-                try:
-                    text = chunk.decode("utf-8")
-                except Exception:
-                    text = chunk.decode("utf-8", "replace")
-                text = text.replace("\r\n", "\n")
-
-                # 2) 라인 단위로 가볍게 SSE 보일러플레이트 제거
-                #    - data: xxx    → xxx
-                #    - event:/id:/코멘트(: ...) 라인은 무시
-                #    - [DONE] 같은 종료 센티넬은 무시
-                cleaned_lines: list[str] = []
-                for line in text.split("\n"):
-                    ls = line.lstrip()
-                    if not ls:
-                        continue
-                    if ls.startswith(":"):  # SSE comment line
-                        continue
-                    if ls.lower().startswith("event:") or ls.lower().startswith("id:"):
-                        continue
-                    if ls[:5].lower() == "data:":
-                        payload = ls[5:].lstrip()
-                        if payload.strip() in {"[DONE]", ""}:
-                            continue
-                        cleaned_lines.append(payload)
-                    else:
-                        # NDJSON 등 비표준도 최대한 통과
-                        cleaned_lines.append(line)
-
-                piece = "\n".join(cleaned_lines)
-                if not piece:
-                    continue
-
-                # 3) chunk별 delta 이벤트 전송(A2A 메시지 규격 + JSON-RPC 랩핑)
-                final_buf.append(piece)
-                out_delta = _rpc_envelope(rpc_id, _a2a_message_text(piece))
-                yield _sse_event(out_delta)
-
-        except (asyncio.CancelledError, BrokenPipeError, ConnectionResetError):
-            # 다운스트림 종료 → 조용히 정리
-            return
-        except Exception as e:
-            # 에러를 메시지로 알리고 종료(원하면 로그만 남기고 return 해도 됨)
-            err = _rpc_envelope(rpc_id, _a2a_message_text(f"[proxy error] {e}"))
-            yield _sse_event(err)
-            return
-
-        # 4) 스트림 종료 시 "완성 텍스트" 1회 추가 송출
-        if final_buf:
-            full = "".join(final_buf)
-            # 연속 개행 정리(선택)
-            full = re.sub(r"\n{3,}", "\n\n", full).strip()
-            if full:
-                out_final = _rpc_envelope(rpc_id, _a2a_message_text(full))
-                yield _sse_event(out_final)
-
-
-    def _guess_output_text(data: Any) -> str:
-        """Langflow 비스트리밍 응답에서 텍스트 추출 (여러 케이스 방어)."""
-        if isinstance(data, str):
-            return data
-        if isinstance(data, dict):
-            for k in ("output_text", "text", "message", "result", "data"):
-                v = data.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v
-            outs = data.get("outputs")
-            if isinstance(outs, list) and outs:
-                cand = outs[0]
-                if isinstance(cand, dict):
-                    for k in ("text", "output_text", "result"):
-                        v = cand.get(k)
-                        if isinstance(v, str) and v.strip():
-                            return v
-        try:
-            return json.dumps(data, ensure_ascii=False)
-        except Exception:
-            return str(data)
-        
     # _sse_proxy_app(...) 내부, "helpers" 블록에 추가
     async def _raise_upstream_or_http(resp: httpx.Response) -> None:
         """Langflow 4xx/5xx → FastAPI HTTPException"""
@@ -553,27 +461,13 @@ def _sse_proxy_app(
     @app.get("/health")
     async def health():
         """상세한 헬스체크 - flow 해석 포함"""
-        try:
-            # flow 해석을 시도하되, 실패해도 프록시 자체는 동작 중
-            rid, rname = await _resolve_for_request(None)
-            return {
-                "ok": True, 
-                "status": "proxy_running",
-                "flow_id": rid, 
-                "flow_name": rname,
-                "timestamp": time.time()
-            }
-        except Exception as e:
-            # flow 해석 실패해도 프록시 자체는 동작 중
-            log.warning(f"health: flow resolve failed: {e}")
-            return {
-                "ok": True,  # 프록시 자체는 동작 중
-                "status": "proxy_ready_flow_error",
-                "flow_id": None,
-                "flow_name": None,
-                "flow_error": str(e),
-                "timestamp": time.time()
-            }
+        return {
+            "ok": True, 
+            "status": "proxy_running",
+            "flow_id": resolved_flow_id, 
+            "flow_name": resolved_flow_name,
+            "timestamp": time.time()
+        }
 
     @app.post("/discovery/register")
     async def discovery_register():
@@ -596,15 +490,10 @@ def _sse_proxy_app(
 
     @app.get("/agent-card")
     async def agent_card():
-        rid, rname = "", ""
-        try:
-            rid, rname = await _resolve_for_request(None)
-        except Exception:
-            pass
         if not agent_card_payload:
             raise HTTPException(status_code=404, detail="Agent card not found")
         result = dict(agent_card_payload)
-        result["flow"] = {"id": rid, "name": rname}
+        result["flow"] = {"id": resolved_flow_id, "name": resolved_flow_name}
         return result
 
     # well-known: 표준 경로만 제공
@@ -648,18 +537,29 @@ def _sse_proxy_app(
         return None
 
     async def _handle_jsonrpc(request: Request):
-        print("[proxy] hit", request.url.path, "accept=", request.headers.get("accept"))
 
         body = await request.json()
         rpc_id = body.get("id") or str(uuid4())
         params = body.get("params", {}) or {}
 
-        want_stream = bool(params.get("stream")) or (
+        # stream 파라미터 처리: "false", "0", false, 0 등은 False로 처리
+        stream_param = params.get("stream")
+        if isinstance(stream_param, str):
+            stream_param = stream_param.lower() not in ("false", "0", "no", "off")
+        elif isinstance(stream_param, (int, float)):
+            stream_param = bool(stream_param)
+        else:
+            stream_param = bool(stream_param)
+            
+        want_stream = stream_param or (
             "text/event-stream" in (request.headers.get("accept") or "")
         )
+        print(f"[proxy] want_stream={want_stream}, stream_param={stream_param}")
 
         # ① 표준 경로: params.message → text
         msg = params.get("message") or {}
+        print(f"[proxy] msg={msg}")    
+        
         text_in = _message_to_text(msg)
 
         # ② 최후 폴백들: params.input.data / params.text / params.input_value
@@ -673,16 +573,18 @@ def _sse_proxy_app(
             text_in = params["input_value"].strip()
 
         # (임시 디버그) 실제로 무엇을 넘기는지 확인
-        print(f"[proxy] want_stream={want_stream} extracted='{text_in[:80]}'")
+        print(f"[proxy] stream_param={params.get('stream')} want_stream={want_stream} extracted='{text_in[:80]}'")
 
         # ← 여기까지 왔는데도 text_in이 비어있다면, 400으로 명확히 알려주도록 권장
         if not text_in:
             raise HTTPException(status_code=400, detail="No input text found in params.message/params.input/params.text")
 
-        try:
-            rid, rname = await _resolve_for_request(params.get("session_id") or params.get("context_id"))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"flow_id resolve 실패: {e}")
+        # Flow ID 결정: session-as-flow 모드이거나 기본 해결된 값 사용
+        req_session_id = params.get("session_id") or params.get("context_id")
+        if prefer_session_as_flow and req_session_id:
+            rid, rname = req_session_id, "(session-as-flow)"
+        else:
+            rid, rname = resolved_flow_id, resolved_flow_name
 
         # Langflow 호출 페이로드: 입력 타입은 기본을 'chat'로 잡는 편이 안전
         payload = {
@@ -701,27 +603,32 @@ def _sse_proxy_app(
                 # --- helpers ---------------------------------------------------------
                 def _extract_text_from_json_like(s: str) -> str:
                     """
-                    s가 JSON이면 data.text(최우선) → result.data.text → text 순으로 추출.
-                    JSON이 아니거나 경로가 없으면 원문 s를 반환.
+                    s가 JSON이면 Langflow 표준 경로 우선 시도, 실패 시 기본 폴백.
+                    JSON이 아니면 원문 s를 반환.
                     """
                     try:
                         obj = json.loads(s)
                     except Exception:
                         return s
 
-                    def _get_path(d, *keys):
-                        cur = d
-                        for k in keys:
-                            if isinstance(cur, dict) and k in cur:
-                                cur = cur[k]
-                            else:
-                                return None
-                        return cur
+                    # Langflow 표준 outputs 경로 우선 시도
+                    if isinstance(obj, dict):
+                        t0 = _extract_text_from_langflow_json(obj)
+                        if isinstance(t0, str) and t0:
+                            return t0
 
-                    for path in (("data", "text"), ("result", "data", "text"), ("text",)):
-                        v = _get_path(obj, *path)
-                        if isinstance(v, str) and v:
-                            return v
+                    # 기본 폴백: data.text, result.data.text, text 순
+                    if isinstance(obj, dict):
+                        for path in (("data", "text"), ("result", "data", "text"), ("text",)):
+                            cur = obj
+                            for k in path:
+                                if isinstance(cur, dict) and k in cur:
+                                    cur = cur[k]
+                                else:
+                                    cur = None
+                                    break
+                            if isinstance(cur, str) and cur:
+                                return cur
 
                     return s
 
@@ -774,17 +681,16 @@ def _sse_proxy_app(
                                     out = _rpc_envelope(rpc_id, _a2a_message_text(text))
                                     yield _sse_event(out)
 
-                            # (선택) 정상 종료 꼬리표
-                            # yield _sse_event(_rpc_envelope(rpc_id, _a2a_status_text("done")), event="end")
 
-                except asyncio.CancelledError:
-                    print("stream cancelled by client")
                 except (BrokenPipeError, ConnectionResetError):
                     print("downstream closed")
                 except Exception as e:
-                    print(f"stream error: {e!r}")
-                    out = _rpc_envelope(rpc_id, _a2a_message_text(f"[proxy error] {e}"))
-                    yield _sse_event(out)
+                    if "CancelledError" in str(type(e)):
+                        print("stream cancelled by client")
+                    else:
+                        print(f"stream error: {e!r}")
+                        out = _rpc_envelope(rpc_id, _a2a_message_text(f"[proxy error] {e}"))
+                        yield _sse_event(out)
 
             return StreamingResponse(
                 gen(),
@@ -803,7 +709,40 @@ def _sse_proxy_app(
             r = await client.post(url_nonstream, json=payload)
             await _raise_upstream_or_http(r)
             data = r.json()
-            out_text = _guess_output_text(data)
+            # Langflow 비스트리밍 응답에서 텍스트 추출 (우선 경로 → 폴백)
+            out_text = None
+            if isinstance(data, dict):
+                out_text = _extract_text_from_langflow_json(data)
+            if not out_text:
+                if isinstance(data, str):
+                    out_text = data
+                elif isinstance(data, dict):
+                    for k in ("output_text", "text", "message", "result", "data"):
+                        v = data.get(k)
+                        if isinstance(v, str) and v.strip():
+                            out_text = v
+                            break
+                    else:
+                        outs = data.get("outputs")
+                        if isinstance(outs, list) and outs:
+                            cand = outs[0]
+                            if isinstance(cand, dict):
+                                for k in ("text", "output_text", "result"):
+                                    v = cand.get(k)
+                                    if isinstance(v, str) and v.strip():
+                                        out_text = v
+                                        break
+                                else:
+                                    out_text = json.dumps(data, ensure_ascii=False)
+                            else:
+                                out_text = json.dumps(data, ensure_ascii=False)
+                        else:
+                            out_text = json.dumps(data, ensure_ascii=False)
+                else:
+                    try:
+                        out_text = json.dumps(data, ensure_ascii=False)
+                    except Exception:
+                        out_text = str(data)
             return JSONResponse(_rpc_envelope(rpc_id, _a2a_message_text(out_text)))
         
 

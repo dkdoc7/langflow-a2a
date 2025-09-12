@@ -100,7 +100,8 @@ class AgentCardComponent(Component):
 
     inputs = [
         # 필수
-        StrInput(name="name", display_name="Name", required=True),
+        StrInput(name="name", display_name="Name", required=False),
+        StrInput(name="id", display_name="ID", required=True),
         StrInput(
             name="url", display_name="URL", required=True, info="Base URL or entrypoint of the agent.",real_time_refresh=True
         ),
@@ -174,6 +175,7 @@ class AgentCardComponent(Component):
     def _compose_card(self) -> Dict[str, Any]:
         card: Dict[str, Any] = {
             "name": self._attributes.get("name") or "",
+            "id" : self._attributes.get("id") or "",
             "description": self._attributes.get("description") or "",
             "url": self._attributes.get("url") or "",
             "version": self._attributes.get("version") or "1.0.0",
