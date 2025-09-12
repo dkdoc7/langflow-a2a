@@ -1,4 +1,7 @@
 from langchain_core.tools import StructuredTool
+from typing import Dict
+from urllib.parse import quote_plus
+import aiohttp
 
 from langflow.base.agents.agent import LCToolsAgentComponent
 from langflow.base.agents.events import ExceptionWithMessageError
@@ -13,17 +16,14 @@ from langflow.base.models.model_utils import get_model_name
 from langflow.components.helpers.current_date import CurrentDateComponent
 from langflow.components.helpers.memory import MemoryComponent
 from langflow.components.langchain_utilities.tool_calling import ToolCallingAgentComponent
+from langflow.custom.custom_component.component import _get_component_toolkit
 from langflow.custom.utils import update_component_build_config
-from langflow.io import HandleInput, BoolInput, DropdownInput, IntInput, MultilineInput, Output
+from langflow.field_typing import Tool
+from langflow.io import BoolInput, DropdownInput, IntInput, MultilineInput, Output
 from langflow.logging import logger
 from langflow.schema.dotdict import dotdict
 from langflow.schema.message import Message
 
-from langflow.utils.constants import MESSAGE_SENDER_AI, MESSAGE_SENDER_NAME_AI
-from langchain_core.messages import HumanMessage
-import json
-from typing import Any, Dict, List, Optional
-import aiohttp
 
 def set_advanced_true(component_input):
     component_input.advanced = True
@@ -70,56 +70,6 @@ class AgentComponent(ToolCallingAgentComponent):
             advanced=True,
             show=True,
         ),
-
-        #----------------------------------------------------
-        HandleInput(
-            name="execution_plan",
-            display_name="Execution Plan",
-            info="A2A Planner에서 생성된 실행 계획 (JSON Message)",
-            advanced=False,
-            input_types=["Message"],
-            required=True,
-        ),
-
-        BoolInput(
-            name="verbose",
-            display_name="Verbose",
-            value=True,
-            info="Whether to run in verbose mode.",
-            advanced=True,
-        ),
-        MultilineInput(
-            name="system_prompt",
-            display_name="Delegator Instructions", 
-            info="A2A Delegator의 시스템 지시사항",
-            value="""당신은 A2A Discovery 서비스와 연동하여 실행 계획에 따라 작업을 위임하고 관리하는 A2A Delegator입니다.
-
-주요 역할:
-1. A2A Planner가 생성한 실행 계획(execution_plan)을 분석
-2. work_breakdown에서 의존성을 고려하여 다음 실행 가능한 작업 하나를 선택
-3. 각 작업 실행 전 산출물이 이미 등록되었는지 LLM으로 검증
-4. 작업 실행 후 결과를 출력 포트로 A2A Critic 컴포넌트에 전달
-5. Critic이 평가 결과를 A2A Planner에 피드백하여 계획 업데이트
-6. 순환 구조: Planner → Delegator → Critic → Planner → Delegator...
-
-실행 원칙:
-- 의존성 관계를 준수하여 순차적으로 한 번에 하나씩 작업 실행
-- 산출물이 이미 존재하면 작업 스킵하고 다음 작업으로 이동
-- 각 작업의 결과를 추적하여 전체 진행 상황 관리
-- 오류 발생 시 적절한 대응 및 로깅""",
-            advanced=False,
-        ),
-        
-        #----------------------------------------------------
-
-
-
-
-
-
-
-
-
         *LCToolsAgentComponent._base_inputs,
         # removed memory inputs from agent component
         # *memory_inputs,
@@ -131,18 +81,13 @@ class AgentComponent(ToolCallingAgentComponent):
             value=True,
         ),
     ]
-    outputs = [
-        Output(name="response", display_name="Execution Result", method="execute_plan")
-    ]
+    outputs = [Output(name="response", display_name="Response", method="message_response")]
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Execution state for plan-delegation mode (optional)
-        self.task_outputs: Dict[str, Any] = {}
-        self.execution_history: List[Dict[str, Any]] = []
-        self.completed_tasks: set[str] = set()
 
-    async def execute_plan(self) -> Message:
+
+    async def message_response(self) -> Message:
+
+        await self.chat("a12345", "text-analyzer", "네! 작업을 시작하겠습니다.")
         try:
             # Get LLM model and validate
             llm_model, display_name = self.get_llm()
@@ -175,684 +120,22 @@ class AgentComponent(ToolCallingAgentComponent):
                 input_value=self.input_value,
                 system_prompt=self.system_prompt,
             )
-
-
-
-
-            #----------------------------------------------------
-            execution_plan = self.parse_execution_plan(self.execution_plan)
-            work_breakdown = execution_plan.get('work_breakdown', [])
-            
-            if not work_breakdown:
-                return Message(
-                    text="No tasks found in execution plan",
-                    sender=MESSAGE_SENDER_AI,
-                    sender_name=MESSAGE_SENDER_NAME_AI,
-                )
-
-            logger.info(f"Starting task execution with {len(work_breakdown)} tasks")
-
-            # 현재 실행 계획에서 다음 실행 가능한 작업 하나 찾기
-            next_task = self.get_next_executable_task(work_breakdown)
-
-            if not next_task:
-                if self.all_tasks_completed(work_breakdown):
-                    logger.info("All tasks completed successfully!")
-                    final_result = {
-                        "status": "completed",
-                        "completed_tasks": list(self.completed_tasks),
-                        "total_tasks": len(work_breakdown),
-                        "task_outputs": self.task_outputs,
-                        "execution_summary": self.execution_history
-                    }
-                else:
-                    logger.warning("No executable tasks found but not all tasks completed")
-                    final_result = {
-                        "status": "deadlock",
-                        "completed_tasks": list(self.completed_tasks),
-                        "total_tasks": len(work_breakdown),
-                        "task_outputs": self.task_outputs,
-                        "execution_summary": self.execution_history
-                    }
-            else:
-                # 다음 작업 실행
-                logger.info(f"Executing next task: {next_task.get('id')} - {next_task.get('title')}")
-
-                try:                               
-                    task_id = next_task.get('id')
-
-                    # 산출물이 이미 존재하면 작업 스킵
-                    if await self.validate_output_exists(next_task):
-                        result = {
-                            "task_id": task_id,
-                            "status": "skipped",
-                            "reason": "Output already exists",
-                            "outputs": next_task.get('outputs', []),
-                            "task_outputs": next_task.get('outputs', []),
-                            "outputs_completed": True,
-                            "execution_time": 0
-                        }
-                        self.completed_tasks.add(task_id)
-                        task_result = result
-
-                    task_title = next_task.get('title', 'Unknown Task')
-                    agent = next_task.get('agent', None)
-                    agent_name = agent.get("name","Unknown") if agent else "Unknown"
-                    task_result = None
-
-                    # agent가 지정되었고 'self'가 아니라면 작업 위임
-                    if agent and agent_name != 'self':
-                        task_result = await self.delegate_to_agent(next_task, agent)
-                    else:
-                        agent = self.create_agent_runnable()
-                        task_result = await self.run_agent(agent)
-
-                    # 결과 정규화: Message -> dict
-                    if isinstance(task_result, Message):
-                        result_text = task_result.text if hasattr(task_result, "text") else str(task_result)
-                        task_result = {
-                            "task_id": task_id,
-                            "status": "completed",
-                            "task_description": task_title,
-                            "result": result_text,
-                        }
-
-                    # 산출물 저장
-                    for output in next_task.get('outputs', []):
-                        self.task_outputs[output] = task_result.get('result', 'Task completed') if isinstance(task_result, dict) else 'Task completed'
-                    
-                    # 실행 결과에 산출물 정보 추가
-                    if isinstance(task_result, dict):
-                        task_result['task_outputs'] = next_task.get('outputs', [])
-                        task_result['outputs_completed'] = True if task_result.get('status') == 'completed' else False
-                    
-                    self.completed_tasks.add(task_id)
-                    logger.info(f"Task {task_id} completed successfully")
-
-                except Exception as e:
-                        logger.error(f"Error executing task {task_id}: {e}")
-                        task_result = {
-                            "task_id": task_id,
-                            "status": "failed",
-                            "error": str(e),
-                            "task_outputs": next_task.get('outputs', []),
-                            "outputs_completed": False,
-                            "execution_time": 0
-                        }
-
-                self.execution_history.append(task_result)
-
-                self.execution_history_output()
-                
-                # A2A Critic에 전달할 데이터 준비
-                critic_data = self.prepare_critic_data(task_result, execution_plan)
-                final_result = {
-                    "status": "task_completed",
-                    "executed_task": task_result,
-                    "critic_data": critic_data,
-                    "completed_tasks": list(self.completed_tasks),
-                    "total_tasks": len(work_breakdown),
-                    "task_outputs": self.task_outputs,
-                    "remaining_tasks": len(work_breakdown) - len(self.completed_tasks)
-                }
-            #----------------------------------------------------
-
-
-            result_json = json.dumps(final_result, ensure_ascii=False, indent=2)
-            return Message(
-                text=result_json,
-                sender=MESSAGE_SENDER_AI,
-                sender_name=MESSAGE_SENDER_NAME_AI,
-            )
-            
-        except Exception as e:
-            error_msg = f"Agent plan execution error: {str(e)}"
-            logger.error(error_msg)
-            return Message(
-                text=error_msg,
-                sender=MESSAGE_SENDER_AI,
-                sender_name=MESSAGE_SENDER_NAME_AI,
-            )
-
-    def parse_execution_plan(self, plan_message: Message) -> Dict[str, Any]:
-        """실행 계획 메시지를 파싱"""
-        try:
-            if hasattr(plan_message, 'text'):
-                plan_text = plan_message.text
-            else:
-                plan_text = str(plan_message)
-            
-            execution_plan = json.loads(plan_text)
-            return execution_plan
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse execution plan JSON: {e}")
-            raise ValueError(f"Invalid execution plan format: {e}")
-        except Exception as e:
-            logger.error(f"Error parsing execution plan: {e}")
-            raise
-
-    def get_next_executable_task(self, work_breakdown: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """의존성을 고려하여 다음에 실행 가능한 작업 하나를 반환 (순차 실행)"""
-        for task in work_breakdown:
-            task_id = task.get('id')
-            
-            if task_id in self.completed_tasks:
-                continue
-                
-            dependencies = task.get('dependencies', [])
-            dependencies_met = all(dep_id in self.completed_tasks for dep_id in dependencies)
-            
-            if dependencies_met:
-                return task
-        
-        return None
-
-    async def validate_output_exists(self, task: Dict[str, Any]) -> bool:
-        """execution_history를 기반으로 작업의 산출물이 이미 완료되었는지 검증"""
-        try:
-            # 검증 기능이 비활성화된 경우
-            if not getattr(self, 'enable_output_validation', True):
-                logger.info(f"Output validation disabled, proceeding with execution for task '{task.get('title')}'")
-                return False
-                
-            task_outputs = task.get('outputs', [])
-            if not task_outputs:
-                # 산출물이 정의되지 않은 작업은 중복 실행 허용
-                logger.info(f"Task '{task.get('title')}' has no defined outputs, proceeding with execution")
-                return False
-            
-            # execution_history에서 완료된 산출물들 수집
-            completed_outputs = set()
-            for history_item in self.execution_history:
-                if history_item.get('outputs_completed', False):
-                    completed_outputs.update(history_item.get('task_outputs', []))
-            
-            # 현재 작업의 모든 산출물이 이미 완료되었는지 확인
-            required_outputs = set(task_outputs)
-            missing_outputs = required_outputs - completed_outputs
-            
-            if not missing_outputs:
-                logger.info(f"Task '{task.get('title')}' outputs {task_outputs} already completed, skipping execution")
-                return True
-            else:
-                logger.info(f"Task '{task.get('title')}' missing outputs {list(missing_outputs)}, proceeding with execution")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error validating output existence: {e}")
-            logger.info(f"Falling back to assume output doesn't exist for task '{task.get('title')}'")
-            return False
-
-
-    async def execute_builtin_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """내장 기능으로 작업 실행 - a2a-agent.py의 execute_task_directly 방식 사용"""
-        task_id = task.get('id')
-        task_title = task.get('title', 'Unknown Task')
-        
-        logger.info(f"Executing builtin task {task_id}: {task_title}")
-        
-        # a2a-agent.py의 execute_task_directly 로직 적용
-        try:
-            # Tool 힌트가 여러 도구와 충돌하지 않도록 항상 비활성화
-            if hasattr(self, "tool_name"):
-                self.tool_name = ""
-            if hasattr(self, "tool_description"):
-                self.tool_description = ""
-
-            # 작업 단위 입력 프롬프트 구성 (agent.py의 input_value와 유사하게 단일 문자열)
-            inputs = ", ".join(task.get("inputs", []))
-            outputs = ", ".join(task.get("outputs", []))
-            description = task.get("description", "")
-            task_prompt = f"Task: {task_title}\nDescription: {description}\nInputs: {inputs}\nExpected Outputs: {outputs}".strip()
-
-            # 1) Tool이 연결되어 있으면 Tool 우선 사용
-            has_tools = hasattr(self, "tools") and isinstance(self.tools, list) and len(self.tools) > 0
-            if has_tools:
-                logger.info(f"Tools found, executing with tools : {self.tools}")
-                try:
-                    # 여러 도구 사용 허용하되, 단일-툴 힌트는 비활성화하여 검증 충돌 방지
-                    if hasattr(self, "tool_name"):
-                        self.tool_name = ""
-                    if hasattr(self, "tool_description"):
-                        self.tool_description = ""
-
-                    # 기존 도구를 직접 사용하여 Agent 실행 (복수 도구 사용 허용)
-                    self.set(
-                        llm=self.llm,
-                        tools=self.tools,
-                        chat_history=getattr(self, "chat_history", []),
-                        input_value=task_prompt,
-                        system_prompt=getattr(self, "system_prompt", ""),
-                    )
-                    agent = self.create_agent_runnable()
-                    agent_result_msg: Message = await self.run_agent(agent)
-                    result_text = agent_result_msg.text if hasattr(agent_result_msg, "text") else str(agent_result_msg)
-
-                    logger.info(f"-- Tools agent result: {result_text}")
-
-                    return {
-                        "task_id": task_id,
-                        "execution_method": "tools_agent",
-                        "status": "completed",
-                        "task_description": task_title,
-                        "user_input": task_prompt,
-                        "result": result_text,
-                    }
-                except Exception as tool_err:
-                    logger.warning(f"Tool execution failed, falling back to LLM: {tool_err}")
-            else:
-                logger.info("No tools found, executing with LLM")
-
-            # 2) Tool이 없거나 실패한 경우: LLM 기반 일반 처리
-            return await self.handle_general_task(task, task_prompt)
-                
-        except Exception as e:
-            logger.error(f"Error executing builtin task {task_id}: {e}")
-            return {
-                "task_id": task_id,
-                "status": "failed",
-                "error": str(e),
-                "execution_time": 0
-            }
-
-    async def handle_general_task(self, task: Dict[str, Any], user_input: str) -> Dict[str, Any]:
-        """일반적인 작업 처리"""
-        logger.info("일반 작업 실행")
-        
-        # 기본적인 작업 처리
-        task_description = task.get("title", "일반 작업")
-        
-        # LLM이 있는 경우 LLM을 사용
-        if hasattr(self, 'llm') and self.llm is not None:
-            try:
-
-                verbose_prefix = f"**응답은 주어진 task의 outputs에 해당하는 결과만 다음 json 으로 변환하여 반환해주세요.**\n반환형식\n{{'output 요소':'output 값', ... }}\n\n" if not self.verbose else ""
-
-                prompt = f"""{verbose_prefix}
-                
-                다음 작업을 수행해주세요:
-
-작업: {task_description}
-사용자 입력: {user_input}
-
-적절한 방식으로 작업을 완료하고 결과를 제공해주세요."""
-                
-                response = await self.llm.ainvoke([HumanMessage(content=prompt)])
-                result_content = response.content if hasattr(response, 'content') else str(response)
-                
-                # verbose 모드가 아닌 경우 JSON 파싱 적용
-                if not self.verbose:
-                    parsed_result = self._parse_json_from_text(result_content)
-                    if isinstance(parsed_result, dict) and "error" not in parsed_result:
-                        result_content = parsed_result
-                
-                logger.info(f"Basic general task result: {result_content}")
-                
-                return {
-                    "task_id": task["id"],
-                    "execution_method": "llm_general",
-                    "status": "completed",
-                    "task_description": task_description,
-                    "user_input": user_input,
-                    "result": f"🔧 작업: {task_description}\n📝 입력: {user_input}\n\n✅ 결과:\n{result_content}"
-                }
-            except Exception as e:
-                logger.error(f"LLM 일반 작업 실행 중 오류: {e}")
-        
-        # LLM이 없거나 오류가 발생한 경우 기본 처리
-        result_content = f"'{task_description}' 작업을 '{user_input}' 입력으로 처리했습니다. 더 정교한 처리를 위해서는 LLM 모델이나 전용 도구가 필요합니다."
-        
-
-        logger.info(f"Basic general task result: {result_content}")
-        
-        return {
-            "task_id": task["id"],
-            "execution_method": "basic_general",
-            "status": "completed",
-            "task_description": task_description,
-            "user_input": user_input,
-            "result": f"🔧 작업: {task_description}\n📝 입력: {user_input}\n\n✅ 기본 처리 결과:\n{result_content}"
-        }
-
-    async def delegate_to_agent(self, task: Dict[str, Any], agent_info: Dict[str, Any]) -> Dict[str, Any]:
-        """외부 에이전트에 작업 위임"""
-        task_id = task.get('id')
-        task_title = task.get('title', 'Unknown Task')
-        
-        logger.info(f"Delegating task {task_id} to agent: {agent_info.get('name', 'Unknown')}")
-        
-        try:
-            agent_url = agent_info.get('url', agent_info.get('endpoint'))
-            if not agent_url:
-                raise ValueError("Agent URL not found")
-            
-            # verbose 모드에 따라 텍스트 앞부분 결정
-            verbose_prefix = f"**응답은 주어진 task의 outputs에 해당하는 결과만 다음 json 으로 변환하여 반환해주세요.**\n반환형식\n{{'output 요소':'output 값', ... }}\n\n" if not self.verbose else ""
-            
-            a2a_rpc_payload = {
-                "jsonrpc": "2.0",
-                "id": task["id"],
-                "method": "invoke",
-                "params": {
-                    "message": {
-                        "message_id": task["id"],
-                        "role": "user",
-                        "parts": [
-                            {
-                                "kind": "text",
-                                "text": f"{verbose_prefix}Task: {task['title']}\nDescription: {task.get('description', '')}\nInputs: {', '.join(task.get('inputs', []))}\nExpected Outputs: {', '.join(task.get('outputs', []))}"
-                            }
-                        ]
-                    },
-                    "stream": False  # 스트리밍 비활성화
-                }
-            }
-
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "A2A-Agent-Component/1.0"
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    agent_url,
-                    json=a2a_rpc_payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        logger.info(f"Task {task_id} delegated successfully")
-                        extracted_data = self.extract_text_from_agent_response(result)
-
-                        if not extracted_data:
-                            raise Exception("Agent response could not be parsed")
-
-                        response_text = extracted_data["response_text"] 
-                        if not self.verbose and isinstance(response_text, str):
-                            response_text = self._parse_json_from_text(response_text)
-                        
-                        return {
-                            "task_id": task["id"],
-                            "agent_id": agent_info.get('name', 'Unknown'),
-                            "status": "completed",
-                            "timestamp": "2024-01-01T00:00:00Z",
-                            "session_id": extracted_data["session_id"],
-                            "input_text": extracted_data["input_text"],
-                            "response_text": response_text
-                        }
-                    else:
-                        error_text = await response.text()
-                        raise Exception(f"Agent returned status {response.status}: {error_text}")
-                        
-        except Exception as e:
-            logger.error(f"Error delegating task {task_id}: {e}")
-            return {
-                "task_id": task_id,
-                "status": "failed",
-                "error": str(e),
-                "execution_time": 0
-            }
-
-    def extract_text_from_agent_response(self, agent_response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """A2A 에이전트 응답에서 실제 텍스트를 추출하는 헬퍼 함수"""
-        try:
-            # agent_response가 이미 dict인 경우
-            if isinstance(agent_response, dict):
-                obj = agent_response
-            # agent_response가 문자열인 경우 JSON 파싱
-            elif isinstance(agent_response, str):
-                if agent_response.strip().startswith('{'):
-                    obj = json.loads(agent_response)
-                else:
-                    logger.warning("Agent response is not a valid JSON string")
-                    return None
-            else:
-                logger.warning(f"Unexpected agent_response type: {type(agent_response)}")
-                return None
-            
-            # JSON 구조에서 중첩된 JSON 문자열 파싱
-            obj = self._parse_nested_json_strings(obj)
-            
-            # parts 필드들 찾기
-            parts = self.find_parts(obj)
-            
-            if len(parts) == 0:
-                logger.warning("No message fields found in agent response")
-                return None
-
-            #logger.info(f"agent_response parts: {parts[0]}") 
-            
-            # 안전한 데이터 추출
-            try:
-                session_id = self._extract_session_id(parts)
-                input_text = self._extract_input_text(parts)
-                response_text = self._extract_response_text(parts)                
-            except Exception as e:
-                logger.error(f"Error extracting data from parts: {e}")
-                logger.error(f"Parts structure: {parts}")
-                return None 
-            
-            if not response_text:
-                logger.warning("No meaningful text content found in messages")
-                return None
-               
-            return {
-                "session_id": session_id,
-                "input_text": input_text,
-                "response_text": response_text
-            }
-        except Exception as e:
-            logger.error(f"Error extracting text from agent response: {e}")
-            return None
-
-    def _parse_nested_json_strings(self, obj):
-        """중첩된 JSON 문자열을 재귀적으로 파싱"""
-        if isinstance(obj, dict):
-            result = {}
-            for key, value in obj.items():
-                if isinstance(value, str) and value.strip().startswith('{'):
-                    try:
-                        result[key] = self._parse_nested_json_strings(json.loads(value))
-                    except json.JSONDecodeError:
-                        result[key] = value
-                else:
-                    result[key] = self._parse_nested_json_strings(value)
+            agent = self.create_agent_runnable()
+            result = await self.run_agent(agent)
+            logger.info(f"result: {result}")
+            #str = self.decode_unicode_escapes(result.get("text", ""))
+            await self.chat(self._session_id, self._sender, "결과는 다음과 같습니다")
+            await self.chat(self._session_id, self._sender, f"{result}")
             return result
-        elif isinstance(obj, list):
-            return [self._parse_nested_json_strings(item) for item in obj]
-        else:
-            return obj
-
-    def _extract_input_text(self, parts: list) -> str:
-        """parts에서 input_value를 재귀적으로 추출"""
-        if not parts:
-            return "unknown"
-        
-        result = self._find_value_recursive(parts, "input_value", "unknown")
-        return result if result != "unknown" else "unknown"
-
-    def _extract_response_text(self, parts: list) -> str:
-        """parts에서 최종 텍스트를 재귀적으로 추출"""
-        if not parts:
-            return None
-        
-        # message.data.text 경로를 따라 찾기
-        result = self._find_value_recursive(parts, "data", None)
-        
-        text = ""
-        if  result:
-            try:
-                text=result.get("text") if isinstance(result, dict) else ""
-            except Exception:
-                text = ""
-
-        return text
-
-    def _parse_json_from_text(self, text: str) -> Any:
-        """텍스트에서 JSON 구성 정보만 추려서 JSON으로 변환하는 재사용 가능한 함수"""
-        import re
-        
-        # JSON 객체 패턴 찾기 (중괄호로 둘러싸인 부분)
-        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
-        if json_match:
-            json_str = json_match.group(0)
-            try:
-                return json.loads(json_str)
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON from text: {json_str}")
-                return {"error": "JSON parsing failed", "raw_text": text}
-        else:
-            logger.warning(f"No JSON pattern found in text: {text}")
-            return {"error": "No JSON pattern found", "raw_text": text}
-        
-    def find_parts(self, obj: Dict[str, Any]) -> list[Dict[str, Any]]:
-        """
-        JSON(dict/list) 구조 내부를 재귀적으로 탐색하여 
-        'parts' 필드로 지정된 내용을 모두 찾아 리스트로 반환하는 함수
-        """
-        results = []
-
-        if isinstance(obj, dict):
-            # 현재 dict에 'parts' 키가 있으면 추가
-            if "parts" in obj:
-                parts_content = obj["parts"]
-                # parts가 이미 리스트이면 그대로 추가, 아니면 리스트로 변환
-                if isinstance(parts_content, list):
-                    results.extend(parts_content)
-                else:
-                    results.append(parts_content)
-
-            # 재귀적으로 모든 값들을 탐색
-            for value in obj.values():
-                results.extend(self.find_parts(value))
-
-        elif isinstance(obj, list):
-            # 리스트의 각 항목을 재귀적으로 탐색
-            for item in obj:
-                results.extend(self.find_parts(item))
-
-        return results
-
-    def _find_value_recursive(self, obj: Any, target_key: str, default_value: Any = None) -> Any:
-        """
-        중첩된 dict/list 구조에서 특정 키의 값을 재귀적으로 찾는 함수
-        
-        Args:
-            obj: 탐색할 객체 (dict, list, 또는 기타)
-            target_key: 찾을 키 이름
-            default_value: 찾지 못했을 때 반환할 기본값
-            
-        Returns:
-            찾은 값 또는 기본값
-        """
-        if isinstance(obj, dict):
-            # 현재 dict에 타겟 키가 있으면 반환
-            if target_key in obj:
-                return obj[target_key]
-            
-            # 모든 값들을 재귀적으로 탐색
-            for value in obj.values():
-                result = self._find_value_recursive(value, target_key, default_value)
-                if result is not default_value:
-                    return result
-                    
-        elif isinstance(obj, list):
-            # 리스트의 각 요소를 순서대로 탐색
-            for item in obj:
-                result = self._find_value_recursive(item, target_key, default_value)
-                if result is not default_value:
-                    return result
-        
-        return default_value
-
-    def _extract_session_id(self, parts: list) -> str:
-        """parts에서 session_id를 재귀적으로 추출"""
-        if not parts:
-            return "unknown"
-        
-        result = self._find_value_recursive(parts, "session_id", "unknown")
-        return result if result != "unknown" else "unknown"
-
-    def prepare_critic_data(self, task_result: Dict[str, Any], 
-                           current_plan: Dict[str, Any]) -> Dict[str, Any]:
-        """A2A Critic에 전달할 데이터 준비"""
-        logger.info("Preparing data for A2A Critic")
-        
-        try:
-            # task_result에서 response_text 안전하게 처리
-            response_text = task_result.get("response_text", "{}")
-            if isinstance(response_text, str):
-                try:
-                    parsed_response = json.loads(response_text)
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse response_text as JSON: {response_text}")
-                    parsed_response = {"raw_text": response_text}
-            else:
-                parsed_response = response_text if response_text else {}
-            
-            critique_data = {
-                "execution_results": [task_result],
-                "current_plan": current_plan,
-                "task_outputs": self.task_outputs,
-                "task_result": parsed_response,
-                "completed_tasks": list(self.completed_tasks),
-                "total_tasks": len(current_plan.get('work_breakdown', [])),
-                "progress": f"{len(self.completed_tasks)}/{len(current_plan.get('work_breakdown', []))}"
-            }
-            
-            logger.info(f"Critic data structure prepared successfully")
-            return critique_data
-            
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error(f"{type(e).__name__}: {e!s}")
+            raise
+        except ExceptionWithMessageError as e:
+            logger.error(f"ExceptionWithMessageError occurred: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Error preparing critic data: {e}")
-            # 안전한 기본값 반환
-            return {
-                "execution_results": [task_result],
-                "current_plan": current_plan,
-                "task_outputs": self.task_outputs,
-                "task_result": {},
-                "completed_tasks": list(self.completed_tasks),
-                "total_tasks": len(current_plan.get('work_breakdown', [])),
-                "progress": f"{len(self.completed_tasks)}/{len(current_plan.get('work_breakdown', []))}",
-                "error": f"Critic data preparation failed: {str(e)}"
-            }
-
-    def all_tasks_completed(self, work_breakdown: List[Dict[str, Any]]) -> bool:
-        """모든 작업이 완료되었는지 확인"""
-        all_task_ids = {task.get('id') for task in work_breakdown}
-        return all_task_ids.issubset(self.completed_tasks)
-
-    def execution_history_output(self) -> Message:
-        """실행 이력을 반환하는 메서드"""
-        try:
-            history_data = {
-                "execution_history": self.execution_history,
-                "completed_tasks": list(self.completed_tasks),
-                "task_outputs": self.task_outputs,
-                "total_executions": len(self.execution_history),
-                "completion_rate": len(self.completed_tasks) / max(len(self.execution_history), 1) * 100,
-                "last_updated": "현재 시점"
-            }
-            
-            history_json = json.dumps(history_data, ensure_ascii=False, indent=2)
-            
-            return Message(
-                text=f"{history_json}",
-                sender=MESSAGE_SENDER_AI,
-                sender_name=MESSAGE_SENDER_NAME_AI,
-            )
-            
-        except Exception as e:
-            error_msg = f"Error retrieving execution history: {str(e)}"
-            logger.error(error_msg)
-            return Message(
-                text=error_msg,
-                sender=MESSAGE_SENDER_AI,
-                sender_name=MESSAGE_SENDER_NAME_AI,
-            )
+            logger.error(f"Unexpected error: {e!s}")
+            raise
 
     async def get_memory_data(self):
         # TODO: This is a temporary fix to avoid message duplication. We should develop a function for this.
@@ -894,7 +177,182 @@ class AgentComponent(ToolCallingAgentComponent):
                 model_kwargs[input_.name] = getattr(self, f"{prefix}{input_.name}")
         return component.set(**model_kwargs).build_model()
 
+    def set_component_params(self, component):
+        provider_info = MODEL_PROVIDERS_DICT.get(self.agent_llm)
+        if provider_info:
+            inputs = provider_info.get("inputs")
+            prefix = provider_info.get("prefix")
+            model_kwargs = {input_.name: getattr(self, f"{prefix}{input_.name}") for input_ in inputs}
 
+            return component.set(**model_kwargs)
+        return component
 
+    def decode_unicode_escapes(text: str) -> str:
+        """주어진 문자열에 \\uXXXX 형태의 유니코드 이스케이프가 포함되면 사람이 읽을 수 있는 문자로 변환한다."""
+        if not isinstance(text, str):
+            return text
+        # JSON 문자열 리터럴 형태("\uc548...\u...")인 경우 파싱 시도
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, str):
+                return loaded
+        except Exception:
+            pass
+        # 일반 문자열에서 유니코드 이스케이프 디코딩 시도
+        if "\\u" in text:
+            try:
+                return text.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+        return text
+        
+    async def chat(self, session_id: str, sender: str, msg: str) -> Dict[str, any]:
+        """
+        A2A Discovery chat API 호출.
+        Endpoint: POST http://localhost:8000/chat/{session_id}/{sender}?msg={message}
+        """
+        # 인스턴스에 유지(선택적)
+        self._session_id = session_id
+        self._sender = sender
 
+        message_q = quote_plus(msg or "")
+        base_url = "http://localhost:8000"
+        url = f"{base_url}/chat/{session_id}/{sender}?msg={message_q}"
 
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {"status": resp.status, "text": await resp.text()}
+                if resp.status >= 400:
+                    raise ValueError(f"chat API error {resp.status}: {data}")
+                return data
+
+    
+
+    def delete_fields(self, build_config: dotdict, fields: dict | list[str]) -> None:
+        """Delete specified fields from build_config."""
+        for field in fields:
+            build_config.pop(field, None)
+
+    def update_input_types(self, build_config: dotdict) -> dotdict:
+        """Update input types for all fields in build_config."""
+        for key, value in build_config.items():
+            if isinstance(value, dict):
+                if value.get("input_types") is None:
+                    build_config[key]["input_types"] = []
+            elif hasattr(value, "input_types") and value.input_types is None:
+                value.input_types = []
+        return build_config
+
+    async def update_build_config(
+        self, build_config: dotdict, field_value: str, field_name: str | None = None
+    ) -> dotdict:
+        # Iterate over all providers in the MODEL_PROVIDERS_DICT
+        # Existing logic for updating build_config
+        if field_name in ("agent_llm",):
+            build_config["agent_llm"]["value"] = field_value
+            provider_info = MODEL_PROVIDERS_DICT.get(field_value)
+            if provider_info:
+                component_class = provider_info.get("component_class")
+                if component_class and hasattr(component_class, "update_build_config"):
+                    # Call the component class's update_build_config method
+                    build_config = await update_component_build_config(
+                        component_class, build_config, field_value, "model_name"
+                    )
+
+            provider_configs: dict[str, tuple[dict, list[dict]]] = {
+                provider: (
+                    MODEL_PROVIDERS_DICT[provider]["fields"],
+                    [
+                        MODEL_PROVIDERS_DICT[other_provider]["fields"]
+                        for other_provider in MODEL_PROVIDERS_DICT
+                        if other_provider != provider
+                    ],
+                )
+                for provider in MODEL_PROVIDERS_DICT
+            }
+            if field_value in provider_configs:
+                fields_to_add, fields_to_delete = provider_configs[field_value]
+
+                # Delete fields from other providers
+                for fields in fields_to_delete:
+                    self.delete_fields(build_config, fields)
+
+                # Add provider-specific fields
+                if field_value == "OpenAI" and not any(field in build_config for field in fields_to_add):
+                    build_config.update(fields_to_add)
+                else:
+                    build_config.update(fields_to_add)
+                # Reset input types for agent_llm
+                build_config["agent_llm"]["input_types"] = []
+            elif field_value == "Custom":
+                # Delete all provider fields
+                self.delete_fields(build_config, ALL_PROVIDER_FIELDS)
+                # Update with custom component
+                custom_component = DropdownInput(
+                    name="agent_llm",
+                    display_name="Language Model",
+                    options=[*sorted(MODEL_PROVIDERS), "Custom"],
+                    value="Custom",
+                    real_time_refresh=True,
+                    input_types=["LanguageModel"],
+                    options_metadata=[MODELS_METADATA[key] for key in sorted(MODELS_METADATA.keys())]
+                    + [{"icon": "brain"}],
+                )
+                build_config.update({"agent_llm": custom_component.to_dict()})
+            # Update input types for all fields
+            build_config = self.update_input_types(build_config)
+
+            # Validate required keys
+            default_keys = [
+                "code",
+                "_type",
+                "agent_llm",
+                "tools",
+                "input_value",
+                "add_current_date_tool",
+                "system_prompt",
+                "agent_description",
+                "max_iterations",
+                "handle_parsing_errors",
+                "verbose",
+            ]
+            missing_keys = [key for key in default_keys if key not in build_config]
+            if missing_keys:
+                msg = f"Missing required keys in build_config: {missing_keys}"
+                raise ValueError(msg)
+        if (
+            isinstance(self.agent_llm, str)
+            and self.agent_llm in MODEL_PROVIDERS_DICT
+            and field_name in MODEL_DYNAMIC_UPDATE_FIELDS
+        ):
+            provider_info = MODEL_PROVIDERS_DICT.get(self.agent_llm)
+            if provider_info:
+                component_class = provider_info.get("component_class")
+                component_class = self.set_component_params(component_class)
+                prefix = provider_info.get("prefix")
+                if component_class and hasattr(component_class, "update_build_config"):
+                    # Call each component class's update_build_config method
+                    # remove the prefix from the field_name
+                    if isinstance(field_name, str) and isinstance(prefix, str):
+                        field_name = field_name.replace(prefix, "")
+                    build_config = await update_component_build_config(
+                        component_class, build_config, field_value, "model_name"
+                    )
+        return dotdict({k: v.to_dict() if hasattr(v, "to_dict") else v for k, v in build_config.items()})
+
+    async def _get_tools(self) -> list[Tool]:
+        component_toolkit = _get_component_toolkit()
+        tools_names = self._build_tools_names()
+        agent_description = self.get_tool_description()
+        # TODO: Agent Description Depreciated Feature to be removed
+        description = f"{agent_description}{tools_names}"
+        tools = component_toolkit(component=self).get_tools(
+            tool_name="Call_Agent", tool_description=description, callbacks=self.get_langchain_callbacks()
+        )
+        if hasattr(self, "tools_metadata"):
+            tools = component_toolkit(component=self, metadata=self.tools_metadata).update_tools_metadata(tools=tools)
+        return tools

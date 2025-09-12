@@ -1,26 +1,67 @@
-{'T1': {'T1': {'status':                   
-                             'completed', 'outputs': ['단어             
-                             수', '토큰 수'
-            ], 'result':                 
-                             "{'단어 수': '4', '토큰 수':               
-                             '8'
-        }"}, 'outputs': [{'단어                 
-                             수': '4', '토큰 수': '8'
-    }
-]
-},               
-                             'T2': {'T2': {'status':                    
-                             'completed', 'outputs': ['결과             
-                             값'
-    ], 'result': '결과: 512'
-},              
-                             'outputs': [
-    {'단어 수': '4',               
-                             '토큰 수': '8'
-    },
-    {'결과 값':               
-                             '결과: 512'
-    }
-]
-}
-}
+{                     
+                                 "sender": "Machine",                   
+                                 "sender_name": "Agent",                
+                                 "properties": {                        
+                                     "icon": "Bot",                     
+                                     "state": "partial"                 
+                                 },                                     
+                                 "content_blocks": [                    
+                                     {                                  
+                                         "title": "Agent                
+                             Steps",                                    
+                                         "contents": [                  
+                                             {                          
+                                                 "type":                
+                             "text",                                    
+                                                 "duration"             
+                             : 1,                                       
+                                                 "header":              
+                             {                                          
+                                                     "title             
+                             ": "Input",                                
+                                                     "icon"             
+                             : "MessageSquare"                          
+                                                 },                     
+                                                 "text":                
+                             "**Input**: "                              
+                                             },                         
+                                             {                          
+                                                 "type":                
+                             "text",                                    
+                                                 "duration"             
+                             : 788,                                     
+                                                 "header":              
+                             {                                          
+                                                     "title             
+                             ": "Output",                               
+                                                     "icon"             
+                             : "MessageSquare"                          
+                                                 },                     
+                                                 "text":                
+                             "{'\ub2e8\uc5b4 \uc218': '0',              
+                             '\ud1a0\ud070 \uc218': '0',                
+                             '\uc131\uaca9':                            
+                             '\ubaa8\ud638\ud568'}"                     
+                                             }                          
+                                         ],                             
+                                         "allow_markdown":              
+                             true,                                      
+                                         "media_url": null              
+                                     }                                  
+                                 ],                                     
+                                 "session_id":                          
+                             "d5e6ef40-52f9-44e1-a0e2-753f4             
+                             6bd78ad",                                  
+                                 "files": [],                           
+                                 "text": "{'\ub2e8\uc5b4                
+                             \uc218': '0', '\ud1a0\ud070                
+                             \uc218': '0', '\uc131\uaca9':              
+                             '\ubaa8\ud638\ud568'}",                    
+                                 "timestamp": "2025-09-12               
+                             09:34:10 UTC",                             
+                                 "flow_id": null,                       
+                                 "error": false,                        
+                                 "edit": false,                         
+                                 "category": "message",                 
+                                 "duration": null                       
+                             }           

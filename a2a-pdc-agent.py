@@ -1,14 +1,14 @@
 import json
-import asyncio
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
+from urllib.parse import quote_plus
 import aiohttp
 import re
 
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import JsonOutputParser
 
-from langflow.base.agents.agent import LCToolsAgentComponent
 from langflow.base.models.model_input_constants import (
     ALL_PROVIDER_FIELDS,
     MODEL_DYNAMIC_UPDATE_FIELDS,
@@ -16,16 +16,12 @@ from langflow.base.models.model_input_constants import (
     MODEL_PROVIDERS_DICT,
     MODELS_METADATA,
 )
-from langflow.components.helpers.memory import MemoryComponent
 from langflow.components.langchain_utilities.tool_calling import ToolCallingAgentComponent
-from langflow.custom.utils import update_component_build_config
 from langflow.field_typing import Tool
 from langflow.io import BoolInput, DropdownInput, HandleInput, IntInput, MultilineInput, Output, StrInput
 from langflow.logging import logger
-from langflow.schema.dotdict import dotdict
 from langflow.schema.message import Message
 from langflow.utils.constants import MESSAGE_SENDER_AI, MESSAGE_SENDER_NAME_AI
-import re
 
 
 def decide_plan_update(feedback: Dict[str, Any], plan: Dict[str, Any]) -> bool:
@@ -135,6 +131,53 @@ def decode_unicode_escapes(text: str) -> str:
             pass
     return text
 
+def decode_unicode_in_obj(obj):
+    """dict/list 내부의 문자열까지 \\uXXXX 유니코드 이스케이프를 사람이 읽을 수 있게 변환한다."""
+    if isinstance(obj, str):
+        return decode_unicode_escapes(obj)
+    if isinstance(obj, dict):
+        return { (decode_unicode_escapes(k) if isinstance(k, str) else k): decode_unicode_in_obj(v) for k, v in obj.items() }
+    if isinstance(obj, list):
+        return [decode_unicode_in_obj(x) for x in obj]
+    return obj
+
+def coerce_agent_card(value):
+    """agent_card 입력을 dict로 강제 변환하면서 내부 문자열 유니코드 이스케이프를 해제한다."""
+    try:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return decode_unicode_in_obj(value)
+        if hasattr(value, "model_dump"):
+            d = value.model_dump()
+            if isinstance(d, dict):
+                txt = d.get("text")
+                if isinstance(txt, str):
+                    txt_dec = decode_unicode_escapes(txt)
+                    try:
+                        return decode_unicode_in_obj(json.loads(txt_dec))
+                    except Exception:
+                        return {"raw": txt_dec}
+                return decode_unicode_in_obj(d)
+            return d
+        if hasattr(value, "text") and isinstance(getattr(value, "text"), str):
+            txt = decode_unicode_escapes(getattr(value, "text"))
+            try:
+                return decode_unicode_in_obj(json.loads(txt))
+            except Exception:
+                return {"raw": txt}
+        if hasattr(value, "data") and isinstance(getattr(value, "data"), dict):
+            return decode_unicode_in_obj(getattr(value, "data"))
+        if isinstance(value, str):
+            txt = decode_unicode_escapes(value)
+            try:
+                return decode_unicode_in_obj(json.loads(txt))
+            except Exception:
+                return {"raw": txt}
+    except Exception:
+        pass
+    return None
+
 def find_filed(obj, key):
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -172,7 +215,13 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             input_types=["Message"],
             required=False,
         ),
-       
+        HandleInput(  # Agent Card 입력(선택)
+            name="agent_card",
+            display_name="Agent Card",
+            input_types=["Message"],
+            is_list=False,
+            advanced=False,
+        ),
         # 공통: LLM/Provider
         DropdownInput(
             name="agent_llm",
@@ -272,12 +321,74 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
         Output(name="done", display_name="Done", group_outputs=True, method="done_output"),
     ]
 
+    # 클래스 멤버: 세션/보낸이 식별자
+    _session_id: str = ""
+    _sender: str = "unknown"
+
+    async def chat(self, session_id, sender, msg: str) -> Dict[str, Any]:
+        """
+        Discovery 서비스의 chat API를 호출한다.
+        Endpoint: POST {a2a_api_base}/chat/{session_id}/{sender}?msg={message}
+
+        - session_id: self에서 추론 (없으면 새로 생성)
+        - sender: 이 에이전트의 식별자 (self.name 우선, 없으면 클래스명)
+        - message: URL 인코딩 후 query string으로 전달
+        """
+        self._session_id = session_id
+        self._sender = sender
+
+            
+        # message 인코딩
+        message_q = quote_plus(msg or "")
+        # a2a_api_base를 사용하여 Discovery API 호출
+        base_url = getattr(self, "a2a_api_base", None) or "http://localhost:8000"
+        url = f"{base_url}/chat/{session_id}/{sender}?msg={message_q}"
+
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {"status": resp.status, "text": await resp.text()}
+                if resp.status >= 400:
+                    raise ValueError(f"chat API error {resp.status}: {data}")
+                return data
+
+    @staticmethod
+    def _derive_agent_id(agent_card: Dict[str, Any]) -> str:
+        """Agent ID 정규화: name/url 기반으로 소문자+숫자+대시/언더스코어만 허용."""
+        raw = (agent_card.get("id") or agent_card.get("name") or agent_card.get("url") or "agent").strip()
+        # 공백 → 대시, 비허용 문자 제거
+        norm = re.sub(r"\s+", "-", raw)
+        norm = re.sub(r"[^a-zA-Z0-9_-]", "", norm)
+        if not norm:
+            norm = "agent"
+        return norm.lower()
+
     async def message_response(self) -> Message:
-        logger.info(f"-- PDC : Message response called")
         try:
             await self._initialize_llm()
             # 모든 input 포트 점검 (런타임 전용)
             self._validate_required_ports()
+            logger.info(f"-- PDC : Message response called \n-----")
+
+            agent_card_raw = getattr(self, "agent_card", None)
+            agent_card = coerce_agent_card(agent_card_raw) or {}
+            try:
+                logger.info(f"-- PDC : Agent Card: {json.dumps(agent_card, ensure_ascii=False)}")
+            except Exception:
+                logger.info(f"-- PDC : Agent Card: {agent_card}")
+            sender = self._derive_agent_id(agent_card)
+            self._sender = sender
+            logger.info(f"-- PDC : Sender: {self._sender}")
+
+            # 세션 ID가 없으면 생성하여 클래스 멤버로 유지
+            if not getattr(self, "_session_id", None):
+                self._session_id = str(uuid4())
+
+            await self.chat(self._session_id, self._sender, "안녕하세요?")
+            #return Message(text="안녕하세요?", sender=MESSAGE_SENDER_AI, sender_name=MESSAGE_SENDER_NAME_AI)    
 
             available_agents = await self.get_available_agents()
             # 디버깅 용. plan_input 포트가 연결된 경우 우선 사용 (Message → JSON 파싱)
@@ -519,6 +630,7 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             "output_schema": json.dumps(output_schema, ensure_ascii=False, indent=2),
             "chat_history": getattr(self, "chat_history", []),
         })
+        logger.info(f"-- PDC 11112555: Result: {result} \n-----")
         logger.info(f"-- PDC : Planning has been completed with {len(result['work_breakdown'])} tasks")
         # self.plan 출력을 업데이트
         self.plan = result
@@ -539,12 +651,16 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             try:
                 if agent_id and agent_id != "self":
                     logger.info(f"-- PDC : Delegating task to agent {agent_id}")
+                    await self.chat(self._session_id, self._sender, f"{agent_id} 에이전트에게 작업을 위임합니다.")
                     res = await self.delegate_task_to_agent(task, agent_id, available_agents)
                     #res->result->parts[0]를 추출. 실패일 경우 기본 응답 생성
                     res = res.get("result", {}).get("parts", [{}])[0].get("text", "")
                     new_results[task_id] = {"status": "completed","execution_method": "agent", "result": res, "agent": agent_id}
+                    await self.chat(self._session_id, self._sender, f"{agent_id} 에이전트님 결과 확인했습니다!")
                 else:
                     logger.info(f"-- PDC : Executing task directly")
+                    await self.chat(self._session_id, self._sender, f"{tid}는 제가 직접 수행 합니다.")
+
                     res = await self.execute_task_directly(task, existing_results)
                     res = res.get("result", {})
                     new_results[task_id] = {"status": "completed","execution_method": "self", "result": res, "agent": agent_id}
