@@ -53,7 +53,63 @@ Langflow flow를 A2A JSON-RPC/SSE 프록시로 노출하는 컴포넌트입니�
 - `GET /.well-known/agent-card.json`: 표준 Agent Card 경로
 - `POST /`: JSON-RPC 요청 처리
 
-### 2. Agent Card (A2A)
+### 2. A2A PDCA Agent
+
+Plan-Do-Critic(Act) 사이클을 하나의 컴포넌트에서 오케스트레이션하는 에이전트입니다.
+
+#### 주요 기능
+- **PDCA 사이클 통합**: 계획(Plan) → 실행(Do) → 비평(Critic) → 개선(Act) 사이클을 자동화
+- **A2A 에이전트 위임**: 다른 A2A 에이전트에게 작업을 위임하여 실행
+- **자동 계획 수립**: LLM을 활용한 작업 계획 자동 생성
+- **실행 결과 평가**: 비평 단계를 통한 실행 결과 분석 및 개선 제안
+- **동적 계획 업데이트**: 비평 결과에 따른 계획 자동 수정
+
+#### 입력 파라미터
+
+**기본 설정**
+- `input_value`: 사용자 입력 (Message 연결 가능)
+- `agent_llm`: 언어 모델 프로바이더 (OpenAI, Anthropic, Google 등)
+- `a2a_api_base`: A2A Discovery 서비스 API 기본 URL
+- `a2a_max_iterations`: PDCA 사이클 최대 반복 횟수 (기본값: 3)
+
+**계획 단계 (Plan)**
+- `work_plan_prompt`: 작업 계획 수립 프롬프트 (필수)
+- `plan_schema`: 계획 출력 스키마 (JSON, 필수)
+- `system_prompt`: 에이전트 지시사항
+- `plan_input`: 테스트용 계획 (JSON, 선택사항)
+
+**비평 단계 (Critic)**
+- `critic_prompt`: 실행 결과 평가 프롬프트 (필수)
+
+**도구**
+- `tools`: 사용 가능한 도구 목록 (선택사항)
+
+#### 출력
+
+**종합 결과**
+- `response`: 전체 PDCA 사이클 실행 결과
+
+**단계별 결과**
+- `plan`: 생성된 작업 계획
+- `execution`: 실행 결과
+- `critique`: 비평 결과
+- `updated_plan`: 업데이트된 계획
+- `done`: 완료 여부
+
+#### PDCA 사이클 동작
+
+1. **Plan (계획)**: 사용자 입력을 바탕으로 LLM이 작업 계획을 수립
+2. **Do (실행)**: 계획된 작업을 A2A 에이전트에게 위임하거나 직접 실행
+3. **Critic (비평)**: 실행 결과를 분석하고 개선점을 제안
+4. **Act (개선)**: 비평 결과에 따라 계획을 업데이트하고 다음 사이클 진행
+
+#### A2A 에이전트 연동
+
+- A2A Discovery 서비스를 통해 사용 가능한 에이전트 목록을 자동 조회
+- 작업에 적합한 에이전트를 자동 선택하여 위임
+- JSON-RPC 프로토콜을 통한 에이전트 간 통신
+
+### 3. Agent Card (A2A)
 
 A2A 호환 Agent Card JSON을 생성하는 컴포넌트입니다.
 
@@ -78,7 +134,7 @@ A2A 호환 Agent Card JSON을 생성하는 컴포넌트입니다.
 - `skills_handle`: 스킬 컴포넌트 연결
 - `extra`: 추가 필드 (JSON 형식)
 
-### 3. Skill
+### 4. Skill
 
 에이전트의 스킬을 정의하는 컴포넌트입니다.
 
