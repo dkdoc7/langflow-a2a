@@ -216,7 +216,7 @@ class AgentComponent(ToolCallingAgentComponent):
         self._sender = sender
 
         message_q = quote_plus(msg or "")
-        base_url = "http://localhost:8000"
+        base_url = "http://12.81.26.93:44350"
         url = f"{base_url}/chat/{session_id}/{sender}?msg={message_q}"
 
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
