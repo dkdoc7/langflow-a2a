@@ -375,10 +375,6 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
 
             agent_card_raw = getattr(self, "agent_card", None)
             agent_card = coerce_agent_card(agent_card_raw) or {}
-            try:
-                logger.info(f"-- PDC : Agent Card: {json.dumps(agent_card, ensure_ascii=False)}")
-            except Exception:
-                logger.info(f"-- PDC : Agent Card: {agent_card}")
             sender = self._derive_agent_id(agent_card)
             self._sender = sender
             logger.info(f"-- PDC : Sender: {self._sender}")
@@ -386,9 +382,6 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             # 세션 ID가 없으면 생성하여 클래스 멤버로 유지
             if not getattr(self, "_session_id", None):
                 self._session_id = str(uuid4())
-
-            await self.chat(self._session_id, self._sender, "안녕하세요?")
-            #return Message(text="안녕하세요?", sender=MESSAGE_SENDER_AI, sender_name=MESSAGE_SENDER_NAME_AI)    
 
             available_agents = await self.get_available_agents()
             # 디버깅 용. plan_input 포트가 연결된 경우 우선 사용 (Message → JSON 파싱)
@@ -613,6 +606,7 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
         if planning_prompt is None:
             raise ValueError("Work Plan Prompt 변환에 실패했습니다. 올바른 프롬프트 템플릿을 연결해주세요.")
         
+        await self.chat(self._session_id, self._sender, "**작업계획을 수립")
         # output_schema 입력 포트 처리 (Message -> JSON)
         output_schema = None
         raw = getattr(self.plan_schema, "text", None) or getattr(self.plan_schema, "content", None) or str(self.plan_schema)
@@ -630,7 +624,6 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             "output_schema": json.dumps(output_schema, ensure_ascii=False, indent=2),
             "chat_history": getattr(self, "chat_history", []),
         })
-        logger.info(f"-- PDC 11112555: Result: {result} \n-----")
         logger.info(f"-- PDC : Planning has been completed with {len(result['work_breakdown'])} tasks")
         # self.plan 출력을 업데이트
         self.plan = result
@@ -651,12 +644,16 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             try:
                 if agent_id and agent_id != "self":
                     logger.info(f"-- PDC : Delegating task to agent {agent_id}")
-                    await self.chat(self._session_id, self._sender, f"{agent_id} 에이전트에게 작업을 위임합니다.")
-                    res = await self.delegate_task_to_agent(task, agent_id, available_agents)
-                    #res->result->parts[0]를 추출. 실패일 경우 기본 응답 생성
-                    res = res.get("result", {}).get("parts", [{}])[0].get("text", "")
-                    new_results[task_id] = {"status": "completed","execution_method": "agent", "result": res, "agent": agent_id}
-                    await self.chat(self._session_id, self._sender, f"{agent_id} 에이전트님 결과 확인했습니다!")
+                    
+                    agent_alive = await self.check_hello(agent_id, available_agents)
+                    logger.info(f"---agent_alive--{agent_alive}")
+                    if agent_alive :
+                        await self.chat(self._session_id, self._sender, f"{agent_id} 에이전트에게 작업을 위임합니다.")
+                        res = await self.delegate_task_to_agent(task, agent_id, available_agents)
+                        #res->result->parts[0]를 추출. 실패일 경우 기본 응답 생성
+                        res = res.get("result", {}).get("parts", [{}])[0].get("text", "")
+                        new_results[task_id] = {"status": "completed","execution_method": "agent", "result": res, "agent": agent_id}
+                        await self.chat(self._session_id, self._sender, f"{agent_id} 에이전트님 결과 확인했습니다!")
                 else:
                     logger.info(f"-- PDC : Executing task directly")
                     await self.chat(self._session_id, self._sender, f"{tid}는 제가 직접 수행 합니다.")
@@ -767,6 +764,35 @@ class A2APDCAgentComponent(ToolCallingAgentComponent):
             except Exception:
                 pass
         return {"task_id": task.get("id"), "execution_method": "basic_general", "status": "completed", "result": f"Task '{title}' processed."}
+
+    async def check_hello(self, agent_id: str, available_agents: List[Dict[str, Any]]) -> Dict[str, Any]:
+        
+
+        target = next((a for a in available_agents if a.get("id") == agent_id), None)
+        if not target:
+            raise ValueError(f"Agent '{agent_id}' not found")
+        agent_url = target.get("url") or target.get("endpoint")
+        # URL 타입 보정 및 검증'
+        if agent_url is None:
+            raise ValueError("Agent URL not found")
+        if not isinstance(agent_url, str):
+            agent_url = str(agent_url)
+        if not agent_url:
+            raise ValueError("Agent URL not found")
+        if isinstance(agent_url, str) and "0.0.0.0" in agent_url:
+            agent_url = agent_url.replace("0.0.0.0", "127.0.0.1")
+
+        await self.chat(self._session_id, self._sender, f"안녕하세요? {agent_id}")
+        logger.info(f"----------------------------------------{agent_url}-----------------------")
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(agent_url+"agent-card",  headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.info("-------------dkdkdkdkdk------------------")
+                    return data
+                raise ValueError(f"Agent returned status {resp.status}")
+
 
     async def delegate_task_to_agent(self, task: Dict[str, Any], agent_id: str, available_agents: List[Dict[str, Any]]) -> Dict[str, Any]:
         
